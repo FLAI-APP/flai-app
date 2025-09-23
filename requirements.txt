@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-openai
-psycopg2-binary
 sqlalchemy
-
+psycopg2-binary
+openai
