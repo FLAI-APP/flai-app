@@ -3,7 +3,8 @@ from fastapi import FastAPI, Request
 
 APP = FastAPI()
 
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "flai-verify-123")
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
+print(">>> TOKEN LETTO DA RENDER:", repr(META_VERIFY_TOKEN), flush=True)
 
 @APP.get("/")
 def root():
