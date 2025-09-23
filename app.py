@@ -1,17 +1,35 @@
 import os
+from datetime import datetime
 from fastapi import FastAPI, Request, Query
+from sqlalchemy import create_engine, text
 from openai import OpenAI
 
 APP = FastAPI()
 
-# --- Config ---
+# --- ENV ---
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
-print(">>> TOKEN LETTO DA RENDER:", repr(META_VERIFY_TOKEN), flush=True)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# OpenAI Client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+print(">>> META_VERIFY_TOKEN:", repr(META_VERIFY_TOKEN), flush=True)
+print(">>> HAS OPENAI KEY:", bool(OPENAI_API_KEY), flush=True)
+print(">>> HAS DATABASE_URL:", bool(DATABASE_URL), flush=True)
 
-# --- ROUTES ---
+# --- OpenAI ---
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# --- DB engine + tabella ---
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+with engine.begin() as conn:
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        content TEXT NOT NULL,
+        reply   TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+    )
+    """))
 
 @APP.get("/")
 def root():
@@ -21,7 +39,7 @@ def root():
 def healthz():
     return "ok"
 
-# --- GET /webhook: verifica iniziale di Meta ---
+# --- GET /webhook: verifica Meta (accetta hub.* e hub_*) ---
 @APP.get("/webhook")
 def verify(
     request: Request,
@@ -43,31 +61,41 @@ def verify(
             return challenge
     return "forbidden"
 
-# --- POST /webhook: gestisce messaggi in ingresso ---
+# --- POST /webhook: chiede risposta a GPT e salva in DB ---
 @APP.post("/webhook")
 async def incoming(req: Request):
     body = await req.json()
-    print(">>> WEBHOOK BODY:", body, flush=True)
+    msg = (body.get("message") or "").strip()
 
-    # Prendiamo il campo "message" (simuliamo WhatsApp/Meta)
-    text = body.get("message", "").strip()
+    if not msg:
+        return {"error": "no message"}
 
-    if text:
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Sei un assistente aziendale. Rispondi in modo chiaro e conciso."},
-                    {"role": "user", "content": text}
-                ],
-                temperature=0.2
-            )
-            reply = resp.choices[0].message.content.strip()
-            print(">>> RISPOSTA GPT:", reply, flush=True)
-            return {"reply": reply}
-        except Exception as e:
-            print(">>> ERRORE GPT:", str(e), flush=True)
-            return {"error": str(e)}
+    # 1) GPT
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role":"system","content":"Sei un assistente aziendale. Rispondi in modo chiaro e conciso."},
+            {"role":"user","content": msg}
+        ],
+        temperature=0.2
+    )
+    reply = resp.choices[0].message.content.strip()
 
-    return {"ok": True}
+    # 2) Salva in DB
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO messages (content, reply, created_at) VALUES (:c, :r, :t)"),
+            {"c": msg, "r": reply, "t": datetime.utcnow()}
+        )
+
+    return {"reply": reply}
+
+# --- GET /messages: ultimi 10 messaggi salvati ---
+@APP.get("/messages")
+def last_messages():
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("SELECT id, content, reply, created_at FROM messages ORDER BY created_at DESC LIMIT 10")
+        ).mappings().all()
+    return {"items": [dict(r) for r in rows]}
 
