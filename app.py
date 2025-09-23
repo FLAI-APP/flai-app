@@ -1,5 +1,21 @@
-from fastapi import Query, Request
+import os
+from fastapi import FastAPI, Request, Query
 
+APP = FastAPI()
+
+# Legge il token dall'env (Render → Environment)
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
+print(">>> TOKEN LETTO DA RENDER:", repr(META_VERIFY_TOKEN), flush=True)
+
+@APP.get("/")
+def root():
+    return {"status": "ok", "service": "flai-app"}
+
+@APP.get("/healthz")
+def healthz():
+    return "ok"
+
+# --- GET /webhook: accetta sia hub.* (Meta) sia hub_* (test manuale) ---
 @APP.get("/webhook")
 def verify(
     request: Request,
@@ -10,7 +26,6 @@ def verify(
     hub_challenge_alt: str | None = Query(None, alias="hub_challenge"),
     hub_verify_token_alt: str | None = Query(None, alias="hub_verify_token"),
 ):
-    # Prendi il valore dai parametri "dot" o dagli "underscore"
     mode = hub_mode or hub_mode_alt
     challenge = hub_challenge or hub_challenge_alt
     token = hub_verify_token or hub_verify_token_alt
@@ -21,4 +36,11 @@ def verify(
         except:
             return challenge
     return "forbidden"
+
+# --- POST /webhook: per ora logga il body ---
+@APP.post("/webhook")
+async def incoming(req: Request):
+    body = await req.json()
+    print(">>> WEBHOOK BODY:", body, flush=True)
+    return {"ok": True}
 
