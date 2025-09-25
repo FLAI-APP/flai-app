@@ -1,4 +1,4 @@
-# app.py — versione completa, pronta da incollare
+# app.py — versione completa, idempotente e pronta al deploy
 import os, time
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -10,18 +10,22 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from openai import OpenAI
 
-# ===== App + CORS ====
+# =========================
+# App & CORS
+# =========================
 APP = FastAPI()
 
 origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","").split(",") if o.strip()]
 APP.add_middleware(
     CORSMiddleware,
-    allow_origins=origins or [],   # in prod, metti solo i domini reali
+    allow_origins=origins or [],   # in prod: metti solo i domini reali
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===== Env =====
+# =========================
+# ENV
+# =========================
 API_KEY_APP       = os.getenv("API_KEY_APP", "")
 DEBUG             = os.getenv("DEBUG","false").lower() == "true"
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN","")
@@ -31,33 +35,65 @@ if DATABASE_URL and "sslmode=" not in DATABASE_URL:
     sep = "&" if "?" in DATABASE_URL else "?"
     DATABASE_URL = DATABASE_URL + f"{sep}sslmode=require"
 
-# ===== Clients =====
+# =========================
+# Clients
+# =========================
 client = OpenAI(api_key=OPENAI_API_KEY)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-# ===== Create tables if missing =====
-with engine.begin() as conn:
-    conn.execute(text("""
-    CREATE TABLE IF NOT EXISTS messages (
-      id SERIAL PRIMARY KEY,
-      content   TEXT NOT NULL,
-      reply     TEXT,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-    """))
-    conn.execute(text("""
-    CREATE TABLE IF NOT EXISTS movements (
-      id SERIAL PRIMARY KEY,
-      type VARCHAR(10) NOT NULL,
-      amount NUMERIC(14,2) NOT NULL,
-      currency VARCHAR(8) NOT NULL DEFAULT 'CHF',
-      category VARCHAR(50),
-      note TEXT,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-    """))
+# =========================
+# Schema DB (auto-create & auto-fix idempotenti)
+# =========================
+def _bootstrap_schema():
+    with engine.begin() as conn:
+        # messages
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS messages (
+          id SERIAL PRIMARY KEY,
+          content   TEXT NOT NULL,
+          reply     TEXT,
+          created_at TIMESTAMP DEFAULT NOW()
+        );
+        """))
+        # movements base
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS movements (
+          id SERIAL PRIMARY KEY
+        );
+        """))
+        # colonne obbligatorie/mancanti (idempotenti)
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS type VARCHAR(10);"))
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS amount NUMERIC(14,2);"))
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS currency VARCHAR(8);"))
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS category VARCHAR(50);"))
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS note TEXT;"))
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS created_at TIMESTAMP;"))
+        # default e NOT NULL coerenti
+        conn.execute(text("ALTER TABLE movements ALTER COLUMN currency SET DEFAULT 'CHF';"))
+        conn.execute(text("ALTER TABLE movements ALTER COLUMN created_at SET DEFAULT NOW();"))
+        conn.execute(text("UPDATE movements SET currency='CHF' WHERE currency IS NULL;"))
+        conn.execute(text("UPDATE movements SET created_at=NOW() WHERE created_at IS NULL;"))
+        # type e amount come NOT NULL con valori di fallback
+        conn.execute(text("UPDATE movements SET type='in' WHERE type IS NULL;"))
+        conn.execute(text("UPDATE movements SET amount=0 WHERE amount IS NULL;"))
+        conn.execute(text("ALTER TABLE movements ALTER COLUMN type SET NOT NULL;"))
+        conn.execute(text("ALTER TABLE movements ALTER COLUMN amount SET NOT NULL;"))
+        conn.execute(text("ALTER TABLE movements ALTER COLUMN currency SET NOT NULL;"))
+        # gestione colonna 'voce' se presente NOT NULL: rilassa + default
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS voce VARCHAR(50);"))
+        conn.execute(text("ALTER TABLE movements ALTER COLUMN voce DROP NOT NULL;"))
+        conn.execute(text("ALTER TABLE movements ALTER COLUMN voce SET DEFAULT 'generale';"))
+        conn.execute(text("UPDATE movements SET voce='generale' WHERE voce IS NULL;"))
 
-# ===== Rate limit soft (per pod) =====
+try:
+    _bootstrap_schema()
+except Exception as e:
+    # non bloccare lo startup: la diagnosi arriverà da /debug
+    print("SCHEMA_BOOTSTRAP_ERROR:", e, flush=True)
+
+# =========================
+# Rate limit soft (per pod)
+# =========================
 WINDOW_SECONDS = 60
 MAX_REQ = 60
 _bucket = {}  # {key: (window_start_ts, count)}
@@ -71,8 +107,8 @@ def _client_key(req: Request) -> str:
 async def security_and_rate_limit(request: Request, call_next):
     path = request.url.path
 
-    # endpoints aperti per Meta e diagnostica temporanea
-    open_paths = {"/", "/healthz", "/webhook", "/debug", "/echo"}
+    # endpoints aperti (Meta non manda header custom)
+    open_paths = {"/", "/healthz", "/webhook", "/debug", "/echo", "/diag/movements/columns"}
     if path not in open_paths:
         if not API_KEY_APP:
             return JSONResponse({"error":"server_misconfigured_no_api_key"}, status_code=500)
@@ -91,11 +127,15 @@ async def security_and_rate_limit(request: Request, call_next):
     response = await call_next(request)
     return response
 
-# ===== Schemi =====
+# =========================
+# Schemi pydantic
+# =========================
 class IncomingMessage(BaseModel):
     message: str
 
-# ===== Root & health =====
+# =========================
+# Routes base
+# =========================
 @APP.get("/")
 def root():
     return {"status": "ok", "service": "flai-app"}
@@ -104,7 +144,9 @@ def root():
 def healthz():
     return "ok"
 
-# ===== Echo & Debug (aperti per diagnosi) =====
+# =========================
+# Echo & Debug (aperti per diagnosi)
+# =========================
 @APP.get("/echo")
 def echo(request: Request):
     hdr = request.headers.get("x-api-key")
@@ -134,7 +176,9 @@ def debug():
         "api_key_length": len(API_KEY_APP) if API_KEY_APP else 0
     }
 
-# ===== Webhook (verify + events) =====
+# =========================
+# WhatsApp verify + events (unificato su /webhook)
+# =========================
 @APP.get("/webhook")
 async def whatsapp_verify(hub_mode: str = "", hub_challenge: str = "", hub_verify_token: str = ""):
     if hub_mode == "subscribe" and hub_verify_token == META_VERIFY_TOKEN:
@@ -204,7 +248,9 @@ async def whatsapp_events(payload: dict = Body(...)):
     except Exception as e:
         return JSONResponse({"error":"wa_parse_error","detail":str(e)}, status_code=200)
 
-# ===== Messages (protetto) =====
+# =========================
+# Messages (protetto)
+# =========================
 @APP.get("/messages")
 def list_messages(limit: int = 20):
     try:
@@ -217,7 +263,9 @@ def list_messages(limit: int = 20):
     except Exception as e:
         return {"error":"db_failed", "detail": str(e)}
 
-# ===== Movements endpoints (protetti) =====
+# =========================
+# Movements (protetti)
+# =========================
 @APP.post("/movements")
 def create_movement(item: dict = Body(...)):
     try:
@@ -232,11 +280,13 @@ def create_movement(item: dict = Body(...)):
         cur = (item.get("currency") or "CHF").upper()
         cat = (item.get("category") or None)
         note = (item.get("note") or None)
+        voce = (item.get("voce") or "generale")  # compat per chi avesse 'voce' NOT NULL
+
         with engine.begin() as conn:
             conn.execute(
-                text("""INSERT INTO movements(type,amount,currency,category,note,created_at)
-                        VALUES (:t,:a,:c,:cat,:n,:ts)"""),
-                {"t":t, "a":Decimal(str(amt)), "c":cur, "cat":cat, "n":note, "ts": datetime.utcnow()}
+                text("""INSERT INTO movements(type,amount,currency,category,note,voce,created_at)
+                        VALUES (:t,:a,:c,:cat,:n,:v,:ts)"""),
+                {"t":t, "a":Decimal(str(amt)), "c":cur, "cat":cat, "n":note, "v": voce, "ts": datetime.utcnow()}
             )
         return {"status":"ok"}
     except HTTPException:
@@ -247,7 +297,7 @@ def create_movement(item: dict = Body(...)):
 @APP.get("/movements")
 def list_movements(_from: str = Query(None, alias="from"), to: str = None, limit: int = 200):
     try:
-        q = "SELECT id,type,amount,currency,category,note,created_at FROM movements WHERE 1=1"
+        q = "SELECT id,type,amount,currency,category,note,voce,created_at FROM movements WHERE 1=1"
         params = {}
         if _from:
             q += " AND created_at >= :f"; params["f"] = _from
@@ -255,6 +305,7 @@ def list_movements(_from: str = Query(None, alias="from"), to: str = None, limit
             q += " AND created_at < :t"; params["t"] = to
         q += " ORDER BY created_at DESC LIMIT :lim"
         params["lim"] = limit
+
         with engine.begin() as conn:
             rows = conn.execute(text(q), params).mappings().all()
             totals = conn.execute(text("""
@@ -266,6 +317,7 @@ def list_movements(_from: str = Query(None, alias="from"), to: str = None, limit
                   AND (:f IS NULL OR created_at >= :f)
                   AND (:t IS NULL OR created_at < :t)
             """), {"f": _from, "t": to}).mappings().first()
+
         total_in  = float(totals["total_in"]) if totals and totals["total_in"]  is not None else 0.0
         total_out = float(totals["total_out"]) if totals and totals["total_out"] is not None else 0.0
         return {"items":[dict(r) for r in rows], "totals": {"total_in": total_in, "total_out": total_out, "net": total_in - total_out}}
@@ -290,13 +342,15 @@ def summary(days: int = 30):
     except Exception as e:
         return {"error":"db_failed_summary","detail":str(e)}
 
-# ======= DIAGNOSTICA COLONNE MOVEMENTS =======
+# =========================
+# Diagnostica schema movements + fix admin
+# =========================
 @APP.get("/diag/movements/columns")
 def diag_movements_columns():
     try:
         with engine.begin() as conn:
             rows = conn.execute(text("""
-                SELECT column_name, data_type
+                SELECT column_name, data_type, is_nullable, column_default
                 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='movements'
                 ORDER BY ordinal_position
@@ -305,49 +359,23 @@ def diag_movements_columns():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ======= FIX SCHEMA MOVEMENTS (ADD COLUMN IF NOT EXISTS) =======
 @APP.post("/admin/fix_movements_schema")
 def fix_movements_schema():
-    """
-    Aggiunge le colonne mancanti nella tabella 'movements':
-    - amount NUMERIC(14,2)
-    - currency VARCHAR(8) DEFAULT 'CHF'
-    - category VARCHAR(50)
-    - note TEXT
-    - created_at TIMESTAMP DEFAULT NOW()
-    - type VARCHAR(10)
-    Non tocca i dati esistenti.
-    """
+    try:
+        _bootstrap_schema()
+        return diag_movements_columns()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@APP.post("/admin/fix_movements_voce")
+def fix_movements_voce():
     try:
         with engine.begin() as conn:
-            # crea tabella se non esiste
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS movements (
-                  id SERIAL PRIMARY KEY,
-                  type VARCHAR(10) NOT NULL,
-                  amount NUMERIC(14,2) NOT NULL,
-                  currency VARCHAR(8) NOT NULL DEFAULT 'CHF',
-                  category VARCHAR(50),
-                  note TEXT,
-                  created_at TIMESTAMP DEFAULT NOW()
-                );
-            """))
-            # allinea colonne mancanti (safe, idempotente)
-            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS amount NUMERIC(14,2);"))
-            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS currency VARCHAR(8) DEFAULT 'CHF';"))
-            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS category VARCHAR(50);"))
-            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS note TEXT;"))
-            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();"))
-            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS type VARCHAR(10);"))
-        # ritorna lo stato colonne aggiornato
-        with engine.begin() as conn:
-            cols = conn.execute(text("""
-                SELECT column_name, data_type
-                FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='movements'
-                ORDER BY ordinal_position
-            """)).mappings().all()
-        return {"ok": True, "columns": [dict(r) for r in cols]}
+            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS voce VARCHAR(50);"))
+            conn.execute(text("ALTER TABLE movements ALTER COLUMN voce DROP NOT NULL;"))
+            conn.execute(text("ALTER TABLE movements ALTER COLUMN voce SET DEFAULT 'generale';"))
+            conn.execute(text("UPDATE movements SET voce='generale' WHERE voce IS NULL;"))
+        return diag_movements_columns()
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
