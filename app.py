@@ -14,10 +14,10 @@ from openai import OpenAI
 # =========================
 APP = FastAPI()
 
-origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","").split(",") if o.strip()]
+ALLOWED = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","").split(",") if o.strip()]
 APP.add_middleware(
     CORSMiddleware,
-    allow_origins=origins or [],   # niente wildcard in prod
+    allow_origins=ALLOWED or [],   # niente wildcard in prod
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -81,9 +81,7 @@ async def security_and_rate_limit(request: Request, call_next):
     path = request.url.path
 
     # endpoint aperti (Meta non manda header custom)
-        open_paths = {"/", "/healthz", "/webhook", "/debug", "/echo"}
-
-
+    open_paths = {"/", "/healthz", "/webhook", "/debug", "/echo"}
     if path not in open_paths:
         if not API_KEY_APP:
             return JSONResponse({"error":"server_misconfigured_no_api_key"}, status_code=500)
@@ -119,6 +117,38 @@ def root():
 @APP.get("/healthz")
 def healthz():
     return "ok"
+
+# =========================
+# Echo & Debug (aperti per diagnosi)
+# =========================
+@APP.get("/echo")
+def echo(request: Request):
+    hdr = request.headers.get("x-api-key")
+    return {
+        "x_api_key_present": bool(hdr),
+        "x_api_key_len": len(hdr) if hdr else 0,
+        "path": str(request.url.path)
+    }
+
+@APP.get("/debug")
+def debug():
+    db_ok = False
+    db_err = ""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception as e:
+        db_ok = False
+        db_err = str(e)
+    return {
+        "has_openai_key": bool(OPENAI_API_KEY),
+        "db_ok": db_ok,
+        "db_error": db_err[:400],
+        "allowed_origins": ALLOWED,
+        "api_key_set": bool(API_KEY_APP),
+        "api_key_length": len(API_KEY_APP) if API_KEY_APP else 0
+    }
 
 # =========================
 # WhatsApp verify + events (unificato su /webhook)
@@ -274,69 +304,4 @@ def summary(days: int = 30):
     total_in  = float(totals["total_in"]) if totals and totals["total_in"]  is not None else 0.0
     total_out = float(totals["total_out"]) if totals and totals["total_out"] is not None else 0.0
     return {"period_days": days, "entrate": total_in, "uscite": total_out, "saldo": total_in - total_out}
-
-# =========================
-# Debug (puoi tenerli finché vuoi)
-# =========================
-@APP.get("/debug")
-def debug():
-    db_ok = False
-    db_err = ""
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("SELECT 1"))
-        db_ok = True
-    except Exception as e:
-        db_ok = False
-        db_err = str(e)
-    return {
-        "has_openai_key": bool(OPENAI_API_KEY),
-        "db_ok": db_ok,
-        "db_error": db_err[:400],
-        "allowed_origins": origins,
-        "api_key_set": bool(API_KEY_APP),
-    }
-
-@APP.post("/dbwrite")
-def dbwrite():
-    try:
-        with engine.begin() as conn:
-            row = conn.execute(
-                text("INSERT INTO messages (content, reply, created_at) VALUES ('SMOKE','OK',:t) RETURNING id"),
-                {"t": datetime.utcnow()}
-            ).mappings().first()
-        return {"ok": True, "id": row["id"]}
-    except Exception as e:
-@APP.get("/echo")
-def echo(request: Request):
-    # NON stampa la tua API key reale; mostra solo se l'header è presente e quanti char ha
-    hdr = request.headers.get("x-api-key")
-    return {
-        "x_api_key_present": bool(hdr),
-        "x_api_key_len": len(hdr) if hdr else 0,
-        "path": str(request.url.path)
-    }
-
-@APP.get("/debug")
-def debug():
-    # controlla DB e chiave OpenAI senza alzare 500
-    db_ok = False
-    db_err = ""
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("SELECT 1"))
-        db_ok = True
-    except Exception as e:
-        db_ok = False
-        db_err = str(e)
-    return {
-        "has_openai_key": bool(OPENAI_API_KEY),
-        "db_ok": db_ok,
-        "db_error": db_err[:400],
-        "allowed_origins": origins,
-        "api_key_set": bool(API_KEY_APP),
-        "api_key_length": len(API_KEY_APP) if API_KEY_APP else 0
-    }
-
-        return {"ok": False, "error": str(e)}
 
