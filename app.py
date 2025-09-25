@@ -81,7 +81,9 @@ async def security_and_rate_limit(request: Request, call_next):
     path = request.url.path
 
     # endpoint aperti (Meta non manda header custom)
-    open_paths = {"/", "/healthz", "/webhook"}
+        open_paths = {"/", "/healthz", "/webhook", "/debug", "/echo"}
+
+
     if path not in open_paths:
         if not API_KEY_APP:
             return JSONResponse({"error":"server_misconfigured_no_api_key"}, status_code=500)
@@ -305,5 +307,36 @@ def dbwrite():
             ).mappings().first()
         return {"ok": True, "id": row["id"]}
     except Exception as e:
+@APP.get("/echo")
+def echo(request: Request):
+    # NON stampa la tua API key reale; mostra solo se l'header è presente e quanti char ha
+    hdr = request.headers.get("x-api-key")
+    return {
+        "x_api_key_present": bool(hdr),
+        "x_api_key_len": len(hdr) if hdr else 0,
+        "path": str(request.url.path)
+    }
+
+@APP.get("/debug")
+def debug():
+    # controlla DB e chiave OpenAI senza alzare 500
+    db_ok = False
+    db_err = ""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception as e:
+        db_ok = False
+        db_err = str(e)
+    return {
+        "has_openai_key": bool(OPENAI_API_KEY),
+        "db_ok": db_ok,
+        "db_error": db_err[:400],
+        "allowed_origins": origins,
+        "api_key_set": bool(API_KEY_APP),
+        "api_key_length": len(API_KEY_APP) if API_KEY_APP else 0
+    }
+
         return {"ok": False, "error": str(e)}
 
