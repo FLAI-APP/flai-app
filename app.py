@@ -104,3 +104,23 @@ def list_messages(limit: int = 20):
         ).mappings().all()
     return {"items": [dict(r) for r in rows]}
 
+@APP.get("/debug")
+def debug():
+    # controlla DB e chiave OpenAI senza far esplodere 500
+    from sqlalchemy import text
+    db_ok = False
+    db_err = ""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception as e:
+        db_ok = False
+        db_err = str(e)
+
+    return {
+        "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
+        "db_ok": db_ok,
+        "db_error": db_err[:400]
+    }
+
