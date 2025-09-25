@@ -168,3 +168,50 @@ def dbwrite():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# --- Schema: ispeziona colonne della tabella messages ---
+@APP.get("/db/columns")
+def db_columns():
+    try:
+        rows = []
+        with engine.begin() as conn:
+            rows = conn.execute(text("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name = 'messages'
+                ORDER BY ordinal_position
+            """)).mappings().all()
+        return {"ok": True, "columns": [dict(r) for r in rows]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# --- Migrazione dolce: se esiste 'text' rinominala in 'content'; se manca 'created_at', aggiungila ---
+@APP.post("/db/migrate")
+def db_migrate():
+    try:
+        with engine.begin() as conn:
+            # Leggi colonne attuali
+            cols = conn.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'messages'
+            """)).scalars().all()
+
+            actions = []
+
+            # Rinomina 'text' -> 'content' se serve
+            if "content" not in cols and "text" in cols:
+                conn.execute(text('ALTER TABLE messages RENAME COLUMN "text" TO content'))
+                actions.append('renamed "text" -> "content"')
+
+            # Aggiungi created_at se manca
+            cols = conn.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'messages'
+            """)).scalars().all()
+            if "created_at" not in cols:
+                conn.execute(text("ALTER TABLE messages ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"))
+                actions.append('added column created_at')
+
+        return {"ok": True, "actions": actions}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
