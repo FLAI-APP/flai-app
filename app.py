@@ -1,14 +1,16 @@
 import os
-from fastapi import FastAPI, Query, Request
+from datetime import datetime
+
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from openai import OpenAI
-from datetime import datetime
 
+# ===== FastAPI =====
 APP = FastAPI()
 
-# CORS (lasciamo aperto per test; poi restringiamo al tuo dominio)
+# CORS "aperto" per test (poi potrai restringere al tuo dominio)
 APP.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,20 +19,20 @@ APP.add_middleware(
     allow_headers=["*"],
 )
 
-# ENV
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+# ===== ENV =====
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")      # es. flai-verify-123
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")         # la tua chiave OpenAI
+DATABASE_URL      = (os.getenv("DATABASE_URL") or "").strip()
 
-# Assicura sslmode=require
+# Forza sslmode=require sul DB (Render/Postgres)
 if DATABASE_URL and "sslmode=" not in DATABASE_URL:
     sep = "&" if "?" in DATABASE_URL else "?"
     DATABASE_URL = DATABASE_URL + f"{sep}sslmode=require"
 
-# OpenAI
+# ===== OpenAI =====
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# DB
+# ===== DB =====
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 with engine.begin() as conn:
     conn.execute(text("""
@@ -42,9 +44,11 @@ with engine.begin() as conn:
     );
     """))
 
+# ===== Schemi =====
 class IncomingMessage(BaseModel):
     message: str
 
+# ===== Routes =====
 @APP.get("/")
 def root():
     return {"status": "ok", "service": "flai-app"}
@@ -53,7 +57,7 @@ def root():
 def healthz():
     return "ok"
 
-# Verifica webhook (Meta)
+# Verifica webhook (Meta: hub.*)
 @APP.get("/webhook")
 def verify(
     hub_mode: str | None = Query(None, alias="hub.mode"),
@@ -67,14 +71,14 @@ def verify(
             return hub_challenge
     return "forbidden"
 
-# Webhook semplice: chiede risposta a GPT e salva su DB
+# Webhook semplice: AI + salva su DB
 @APP.post("/webhook")
 async def incoming(msg: IncomingMessage):
     # 1) risposta AI
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role":"system","content":"Sei un assistente aziendale. Rispondi chiaro e conciso."},
+            {"role":"system","content":"Sei un assistente aziendale. Rispondi chiaro, concreto e conciso."},
             {"role":"user","content": msg.message.strip()}
         ],
         temperature=0.2
