@@ -1,20 +1,23 @@
-import os
-from datetime import datetime
+import os, time
+from datetime import datetime, timedelta
+from decimal import Decimal
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Request, HTTPException, Query, Body
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from openai import OpenAI
 
 # =========================
-# FastAPI + CORS
+# App & CORS
 # =========================
 APP = FastAPI()
+
+origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","").split(",") if o.strip()]
 APP.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # per test; poi limita al tuo dominio
-    allow_credentials=True,
+    allow_origins=origins or [],   # niente wildcard in prod
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -22,24 +25,24 @@ APP.add_middleware(
 # =========================
 # ENV
 # =========================
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")     # es: flai-verify-123
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")        # chiave OpenAI valida
+API_KEY_APP       = os.getenv("API_KEY_APP", "")
+DEBUG             = os.getenv("DEBUG","false").lower() == "true"
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN","")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY","")
 DATABASE_URL      = (os.getenv("DATABASE_URL") or "").strip()
-
-# forza sslmode=require se manca (Render Postgres lo richiede)
 if DATABASE_URL and "sslmode=" not in DATABASE_URL:
     sep = "&" if "?" in DATABASE_URL else "?"
     DATABASE_URL = DATABASE_URL + f"{sep}sslmode=require"
 
 # =========================
-# OpenAI
+# Clients
 # =========================
 client = OpenAI(api_key=OPENAI_API_KEY)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # =========================
-# DB
+# Schema DB (auto-create se non esiste)
 # =========================
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 with engine.begin() as conn:
     conn.execute(text("""
     CREATE TABLE IF NOT EXISTS messages (
@@ -49,9 +52,57 @@ with engine.begin() as conn:
       created_at TIMESTAMP DEFAULT NOW()
     );
     """))
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS movements (
+      id SERIAL PRIMARY KEY,
+      type VARCHAR(10) NOT NULL,          -- 'in' | 'out'
+      amount NUMERIC(14,2) NOT NULL,
+      currency VARCHAR(8) NOT NULL DEFAULT 'CHF',
+      category VARCHAR(50),
+      note TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    """))
 
 # =========================
-# Schemi
+# Rate limit soft (per pod)
+# =========================
+WINDOW_SECONDS = 60
+MAX_REQ = 60
+_bucket = {}  # {key: (window_start_ts, count)}
+
+def _client_key(req: Request) -> str:
+    xf = req.headers.get("x-forwarded-for")
+    ip = xf.split(",")[0].strip() if xf else (req.client.host if req.client else "0.0.0.0")
+    return ip + "|" + (req.headers.get("x-api-key") or "-")
+
+@APP.middleware("http")
+async def security_and_rate_limit(request: Request, call_next):
+    path = request.url.path
+
+    # endpoint aperti (Meta non manda header custom)
+    open_paths = {"/", "/healthz", "/webhook"}
+    if path not in open_paths:
+        if not API_KEY_APP:
+            return JSONResponse({"error":"server_misconfigured_no_api_key"}, status_code=500)
+        if request.headers.get("x-api-key") != API_KEY_APP:
+            raise HTTPException(status_code=401, detail="invalid api key")
+
+        now = int(time.time())
+        key = _client_key(request)
+        wstart, cnt = _bucket.get(key, (now, 0))
+        if now - wstart >= WINDOW_SECONDS:
+            wstart, cnt = now, 0
+        cnt += 1
+        _bucket[key] = (wstart, cnt)
+        if cnt > MAX_REQ:
+            return JSONResponse({"error":"rate_limited","limit_per_min":MAX_REQ}, status_code=429)
+
+    response = await call_next(request)
+    return response
+
+# =========================
+# Schemi pydantic
 # =========================
 class IncomingMessage(BaseModel):
     message: str
@@ -67,60 +118,84 @@ def root():
 def healthz():
     return "ok"
 
-# Verifica webhook (Meta: hub.*)
+# =========================
+# WhatsApp verify + events (unificato su /webhook)
+# =========================
 @APP.get("/webhook")
-def verify(
-    hub_mode: str | None = Query(None, alias="hub.mode"),
-    hub_challenge: str | None = Query(None, alias="hub.challenge"),
-    hub_verify_token: str | None = Query(None, alias="hub.verify_token"),
-    # accetta anche varianti senza punto (per test manuali)
-    hub_mode_alt: str | None = Query(None, alias="hub_mode"),
-    hub_challenge_alt: str | None = Query(None, alias="hub_challenge"),
-    hub_verify_token_alt: str | None = Query(None, alias="hub_verify_token"),
-):
-    mode = hub_mode or hub_mode_alt
-    challenge = hub_challenge or hub_challenge_alt
-    token = hub_verify_token or hub_verify_token_alt
-    if mode == "subscribe" and token == META_VERIFY_TOKEN and challenge:
-        try:
-            return int(challenge)
-        except:
-            return challenge
-    return "forbidden"
+async def whatsapp_verify(hub_mode: str = "", hub_challenge: str = "", hub_verify_token: str = ""):
+    if hub_mode == "subscribe" and hub_verify_token == META_VERIFY_TOKEN:
+        return PlainTextResponse(hub_challenge or "", media_type="text/plain")
+    raise HTTPException(status_code=403, detail="verification_failed")
 
-# =========================
-# Webhook: AI + salva su DB (versione stabile)
-# =========================
 @APP.post("/webhook")
-async def incoming(msg: IncomingMessage):
-    # 1) risposta AI (gestione errori esplicita)
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":"Sei un assistente aziendale. Rispondi chiaro, concreto e conciso."},
-                {"role":"user","content": msg.message.strip()}
-            ],
-            temperature=0.2
-        )
-        reply_text = resp.choices[0].message.content.strip()
-    except Exception as e:
-        return {"error":"openai_failed", "detail": str(e)}
-
-    # 2) salva su DB (gestione errori esplicita)
-    try:
-        with engine.begin() as conn:
-            conn.execute(
-                text("INSERT INTO messages (content, reply, created_at) VALUES (:c,:r,:t)"),
-                {"c": msg.message, "r": reply_text, "t": datetime.utcnow()}
+async def whatsapp_events(payload: dict = Body(...)):
+    # Demo: {"message": "..."}  (nostro test manuale)
+    if "message" in payload:
+        user_msg = (payload.get("message") or "").strip()
+        if not user_msg:
+            return {"error":"no message"}
+        # AI
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role":"system","content":"Sei un assistente aziendale. Rispondi chiaro, concreto e conciso."},
+                    {"role":"user","content": user_msg}
+                ],
+                temperature=0.2
             )
-    except Exception as e:
-        return {"error":"db_failed", "detail": str(e)}
+            reply_text = resp.choices[0].message.content.strip()
+        except Exception as e:
+            return {"error":"openai_failed","detail":str(e)}
+        # Save
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("INSERT INTO messages (content, reply, created_at) VALUES (:c,:r,:t)"),
+                    {"c": user_msg, "r": reply_text, "t": datetime.utcnow()}
+                )
+        except Exception as e:
+            return {"error":"db_failed","detail":str(e)}
+        return {"reply": reply_text}
 
-    return {"reply": reply_text}
+    # Meta payload (semplificato)
+    try:
+        entry = payload.get("entry", [])[0]
+        change = entry.get("changes", [])[0]
+        value = change.get("value", {})
+        messages = value.get("messages", [])
+        if not messages:
+            return {"status":"ok"}
+        msg = messages[0]
+        text_in = msg.get("text", {}).get("body", "") or "[unsupported message type]"
+        # AI (preview)
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role":"system","content":"Sei un assistente aziendale. Rispondi chiaro, concreto e conciso."},
+                    {"role":"user","content": text_in}
+                ],
+                temperature=0.2
+            )
+            reply_text = resp.choices[0].message.content.strip()
+        except Exception as e:
+            reply_text = f"[openai_failed: {e}]"
+        # Save
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("INSERT INTO messages (content, reply, created_at) VALUES (:c,:r,:t)"),
+                    {"c": text_in, "r": reply_text, "t": datetime.utcnow()}
+                )
+        except Exception:
+            pass
+        return {"status":"ok","preview_reply": reply_text[:200]}
+    except Exception as e:
+        return JSONResponse({"error":"wa_parse_error","detail":str(e)}, status_code=200)
 
 # =========================
-# Lista messaggi (sicura)
+# Messages (protetto da API key)
 # =========================
 @APP.get("/messages")
 def list_messages(limit: int = 20):
@@ -135,11 +210,74 @@ def list_messages(limit: int = 20):
         return {"error":"db_failed", "detail": str(e)}
 
 # =========================
-# Diagnostica
+# Movements + Summary (protetti)
+# =========================
+@APP.post("/movements")
+def create_movement(item: dict = Body(...)):
+    t = (item.get("type") or "").strip().lower()
+    if t not in ("in","out"):
+        raise HTTPException(422, "type must be 'in' or 'out'")
+    amt = item.get("amount")
+    try:
+        amt = float(amt)
+    except:
+        raise HTTPException(422, "amount must be numeric")
+    cur = (item.get("currency") or "CHF").upper()
+    cat = (item.get("category") or None)
+    note = (item.get("note") or None)
+    with engine.begin() as conn:
+        conn.execute(
+            text("""INSERT INTO movements(type,amount,currency,category,note,created_at)
+                    VALUES (:t,:a,:c,:cat,:n,:ts)"""),
+            {"t":t, "a":Decimal(str(amt)), "c":cur, "cat":cat, "n":note, "ts": datetime.utcnow()}
+        )
+    return {"status":"ok"}
+
+@APP.get("/movements")
+def list_movements(_from: str = Query(None, alias="from"), to: str = None, limit: int = 200):
+    q = "SELECT id,type,amount,currency,category,note,created_at FROM movements WHERE 1=1"
+    params = {}
+    if _from:
+        q += " AND created_at >= :f"; params["f"] = _from
+    if to:
+        q += " AND created_at < :t"; params["t"] = to
+    q += " ORDER BY created_at DESC LIMIT :lim"
+    params["lim"] = limit
+    with engine.begin() as conn:
+        rows = conn.execute(text(q), params).mappings().all()
+        totals = conn.execute(text("""
+            SELECT
+              COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
+              COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
+            FROM movements
+            WHERE 1=1
+              AND (:f IS NULL OR created_at >= :f)
+              AND (:t IS NULL OR created_at < :t)
+        """), {"f": _from, "t": to}).mappings().first()
+    total_in  = float(totals["total_in"]) if totals and totals["total_in"]  is not None else 0.0
+    total_out = float(totals["total_out"]) if totals and totals["total_out"] is not None else 0.0
+    return {"items":[dict(r) for r in rows], "totals": {"total_in": total_in, "total_out": total_out, "net": total_in - total_out}}
+
+@APP.get("/summary")
+def summary(days: int = 30):
+    since = datetime.utcnow() - timedelta(days=days)
+    with engine.begin() as conn:
+        totals = conn.execute(text("""
+            SELECT
+              COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
+              COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
+            FROM movements
+            WHERE created_at >= :since
+        """), {"since": since}).mappings().first()
+    total_in  = float(totals["total_in"]) if totals and totals["total_in"]  is not None else 0.0
+    total_out = float(totals["total_out"]) if totals and totals["total_out"] is not None else 0.0
+    return {"period_days": days, "entrate": total_in, "uscite": total_out, "saldo": total_in - total_out}
+
+# =========================
+# Debug (puoi tenerli finché vuoi)
 # =========================
 @APP.get("/debug")
 def debug():
-    # controlla DB e chiave OpenAI senza alzare 500
     db_ok = False
     db_err = ""
     try:
@@ -152,12 +290,13 @@ def debug():
     return {
         "has_openai_key": bool(OPENAI_API_KEY),
         "db_ok": db_ok,
-        "db_error": db_err[:400]
+        "db_error": db_err[:400],
+        "allowed_origins": origins,
+        "api_key_set": bool(API_KEY_APP),
     }
 
 @APP.post("/dbwrite")
 def dbwrite():
-    # smoke test: scrive una riga fissa nella tabella messages
     try:
         with engine.begin() as conn:
             row = conn.execute(
@@ -165,53 +304,6 @@ def dbwrite():
                 {"t": datetime.utcnow()}
             ).mappings().first()
         return {"ok": True, "id": row["id"]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# --- Schema: ispeziona colonne della tabella messages ---
-@APP.get("/db/columns")
-def db_columns():
-    try:
-        rows = []
-        with engine.begin() as conn:
-            rows = conn.execute(text("""
-                SELECT column_name, data_type
-                FROM information_schema.columns
-                WHERE table_name = 'messages'
-                ORDER BY ordinal_position
-            """)).mappings().all()
-        return {"ok": True, "columns": [dict(r) for r in rows]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# --- Migrazione dolce: se esiste 'text' rinominala in 'content'; se manca 'created_at', aggiungila ---
-@APP.post("/db/migrate")
-def db_migrate():
-    try:
-        with engine.begin() as conn:
-            # Leggi colonne attuali
-            cols = conn.execute(text("""
-                SELECT column_name FROM information_schema.columns
-                WHERE table_name = 'messages'
-            """)).scalars().all()
-
-            actions = []
-
-            # Rinomina 'text' -> 'content' se serve
-            if "content" not in cols and "text" in cols:
-                conn.execute(text('ALTER TABLE messages RENAME COLUMN "text" TO content'))
-                actions.append('renamed "text" -> "content"')
-
-            # Aggiungi created_at se manca
-            cols = conn.execute(text("""
-                SELECT column_name FROM information_schema.columns
-                WHERE table_name = 'messages'
-            """)).scalars().all()
-            if "created_at" not in cols:
-                conn.execute(text("ALTER TABLE messages ADD COLUMN created_at TIMESTAMP DEFAULT NOW()"))
-                actions.append('added column created_at')
-
-        return {"ok": True, "actions": actions}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
