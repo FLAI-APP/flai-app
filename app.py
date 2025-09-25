@@ -290,3 +290,64 @@ def summary(days: int = 30):
     except Exception as e:
         return {"error":"db_failed_summary","detail":str(e)}
 
+# ======= DIAGNOSTICA COLONNE MOVEMENTS =======
+@APP.get("/diag/movements/columns")
+def diag_movements_columns():
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='movements'
+                ORDER BY ordinal_position
+            """)).mappings().all()
+        return {"ok": True, "columns": [dict(r) for r in rows]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ======= FIX SCHEMA MOVEMENTS (ADD COLUMN IF NOT EXISTS) =======
+@APP.post("/admin/fix_movements_schema")
+def fix_movements_schema():
+    """
+    Aggiunge le colonne mancanti nella tabella 'movements':
+    - amount NUMERIC(14,2)
+    - currency VARCHAR(8) DEFAULT 'CHF'
+    - category VARCHAR(50)
+    - note TEXT
+    - created_at TIMESTAMP DEFAULT NOW()
+    - type VARCHAR(10)
+    Non tocca i dati esistenti.
+    """
+    try:
+        with engine.begin() as conn:
+            # crea tabella se non esiste
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS movements (
+                  id SERIAL PRIMARY KEY,
+                  type VARCHAR(10) NOT NULL,
+                  amount NUMERIC(14,2) NOT NULL,
+                  currency VARCHAR(8) NOT NULL DEFAULT 'CHF',
+                  category VARCHAR(50),
+                  note TEXT,
+                  created_at TIMESTAMP DEFAULT NOW()
+                );
+            """))
+            # allinea colonne mancanti (safe, idempotente)
+            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS amount NUMERIC(14,2);"))
+            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS currency VARCHAR(8) DEFAULT 'CHF';"))
+            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS category VARCHAR(50);"))
+            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS note TEXT;"))
+            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();"))
+            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS type VARCHAR(10);"))
+        # ritorna lo stato colonne aggiornato
+        with engine.begin() as conn:
+            cols = conn.execute(text("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='movements'
+                ORDER BY ordinal_position
+            """)).mappings().all()
+        return {"ok": True, "columns": [dict(r) for r in cols]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
