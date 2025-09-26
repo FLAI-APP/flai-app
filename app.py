@@ -146,3 +146,21 @@ def list_movements(_from: str = Query(None, alias="from"), to: str = None, limit
     except Exception as e:
         return {"error": "db_failed_query", "detail": str(e)}
 
+# -------- Summaries --------
+@APP.get("/summaries/overview")
+def summaries_overview():
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT
+                  COALESCE(SUM(CASE WHEN type='in' THEN amount END),0) AS total_in,
+                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
+                FROM movements
+            """)).mappings().first()
+        total_in = float(row["total_in"])
+        total_out = float(row["total_out"])
+        saldo = total_in - total_out
+        return {"in": total_in, "out": total_out, "saldo": saldo}
+    except Exception as e:
+        return {"error": "db_failed_summary", "detail": str(e)}
+
