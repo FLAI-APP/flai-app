@@ -1,6 +1,6 @@
-# app.py — versione minimale stabile (DB fix movements + API)
+# app.py — base stabile + analytics giornalieri + bulk insert
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from fastapi import FastAPI, Request, HTTPException, Body, Query
@@ -104,7 +104,7 @@ def debug():
     except Exception as e:
         return {"db_ok": False, "err": str(e)}
 
-# -------- Movements --------
+# -------- Movements (CRUD essenziale) --------
 @APP.post("/movements")
 def create_movement(item: dict = Body(...)):
     try:
@@ -146,21 +146,99 @@ def list_movements(_from: str = Query(None, alias="from"), to: str = None, limit
     except Exception as e:
         return {"error": "db_failed_query", "detail": str(e)}
 
-# -------- Summaries --------
-@APP.get("/summaries/overview")
-def summaries_overview():
+# -------- Movements: bulk insert --------
+@APP.post("/movements/bulk")
+def bulk_movements(items: list[dict] = Body(...)):
+    """
+    Esempio body:
+    [
+      {"type":"in","amount":1200,"currency":"CHF","category":"sales","note":"giorno 1"},
+      {"type":"out","amount":300,"currency":"CHF","category":"fornitori","note":"pane"}
+    ]
+    """
+    try:
+        if not isinstance(items, list) or not items:
+            raise HTTPException(422, "body must be a non-empty JSON array")
+        now = datetime.utcnow()
+        to_insert = []
+        for it in items:
+            t = (it.get("type") or "").strip().lower()
+            if t not in ("in","out"):
+                raise HTTPException(422, "each item.type must be 'in' or 'out'")
+            amt = Decimal(str(it.get("amount",0)))
+            cur = (it.get("currency") or "CHF").upper()
+            cat = it.get("category")
+            note = it.get("note")
+            voce = it.get("voce") or "generale"
+            to_insert.append({"t":t,"a":amt,"c":cur,"cat":cat,"n":note,"v":voce,"ts":now})
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO movements(type, amount, currency, category, note, voce, created_at)
+                SELECT :t, :a, :c, :cat, :n, :v, :ts
+            """), to_insert)
+        return {"status":"ok","inserted":len(to_insert)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"error":"db_failed_bulk","detail":str(e)}
+
+# -------- Analytics: overview per giorno --------
+@APP.get("/analytics/overview")
+def analytics_overview(days: int = 30):
+    """
+    Restituisce per gli ultimi N giorni:
+    - per_day: elenco con {date, in, out, net}
+    - totals: somma complessiva in/out/net del periodo
+    """
+    if days <= 0 or days > 365:
+        raise HTTPException(422, "days must be between 1 and 365")
+
     try:
         with engine.begin() as conn:
-            row = conn.execute(text("""
+            # serie date
+            per_day = conn.execute(text("""
+                WITH days AS (
+                  SELECT generate_series(
+                    (CURRENT_DATE - (:d::int - 1) * INTERVAL '1 day')::date,
+                    CURRENT_DATE::date,
+                    INTERVAL '1 day'
+                  )::date AS d
+                ),
+                agg AS (
+                  SELECT
+                    DATE(created_at) AS d,
+                    COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS in_amt,
+                    COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS out_amt
+                  FROM movements
+                  WHERE created_at >= CURRENT_DATE - (:d::int - 1) * INTERVAL '1 day'
+                  GROUP BY DATE(created_at)
+                )
                 SELECT
-                  COALESCE(SUM(CASE WHEN type='in' THEN amount END),0) AS total_in,
+                  days.d AS date,
+                  COALESCE(agg.in_amt,0)  AS in,
+                  COALESCE(agg.out_amt,0) AS out,
+                  COALESCE(agg.in_amt,0) - COALESCE(agg.out_amt,0) AS net
+                FROM days
+                LEFT JOIN agg ON agg.d = days.d
+                ORDER BY days.d ASC
+            """), {"d": days}).mappings().all()
+
+            totals = conn.execute(text("""
+                SELECT
+                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
                   COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
                 FROM movements
-            """)).mappings().first()
-        total_in = float(row["total_in"])
-        total_out = float(row["total_out"])
-        saldo = total_in - total_out
-        return {"in": total_in, "out": total_out, "saldo": saldo}
+                WHERE created_at >= CURRENT_DATE - (:d::int - 1) * INTERVAL '1 day'
+            """), {"d": days}).mappings().first()
+
+        tin  = float(totals["total_in"]  or 0)
+        tout = float(totals["total_out"] or 0)
+        return {
+            "days": days,
+            "per_day": [dict(r) for r in per_day],
+            "totals": {"in": tin, "out": tout, "net": tin - tout}
+        }
     except Exception as e:
-        return {"error": "db_failed_summary", "detail": str(e)}
+        return {"error":"db_failed_analytics","detail":str(e)}
 
