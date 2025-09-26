@@ -184,18 +184,34 @@ def bulk_movements(items: list[dict] = Body(...)):
         return {"error":"db_failed_bulk","detail":str(e)}
 
 
+
 @APP.get("/analytics/overview")
-def analytics_overview(days: int = 30):
+def analytics_overview(days: int = 30, compact: int = 0):
     """
     Restituisce per gli ultimi N giorni:
-    - per_day: elenco con {date, in, out, net}
-    - totals: somma complessiva in/out/net del periodo
+    - per_day: [{date, in, out, net}]  (omesso se compact=1)
+    - totals: {in, out, net}
     """
     if days <= 0 or days > 365:
         raise HTTPException(422, "days must be between 1 and 365")
 
     try:
         with engine.begin() as conn:
+            totals = conn.execute(text("""
+                SELECT
+                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
+                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
+                FROM movements
+                WHERE created_at >= CURRENT_DATE - ((CAST(:d AS integer) - 1) * INTERVAL '1 day')
+            """), {"d": days}).mappings().first()
+
+            tin  = float(totals["total_in"]  or 0)
+            tout = float(totals["total_out"] or 0)
+            result = {"days": days, "totals": {"in": tin, "out": tout, "net": tin - tout}}
+
+            if int(compact) == 1:
+                return result
+
             per_day = conn.execute(text("""
                 WITH days AS (
                   SELECT generate_series(
@@ -223,21 +239,7 @@ def analytics_overview(days: int = 30):
                 ORDER BY days.d ASC
             """), {"d": days}).mappings().all()
 
-            totals = conn.execute(text("""
-                SELECT
-                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
-                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
-                FROM movements
-                WHERE created_at >= CURRENT_DATE - ((CAST(:d AS integer) - 1) * INTERVAL '1 day')
-            """), {"d": days}).mappings().first()
-
-        tin  = float(totals["total_in"]  or 0)
-        tout = float(totals["total_out"] or 0)
-        return {
-            "days": days,
-            "per_day": [dict(r) for r in per_day],
-            "totals": {"in": tin, "out": tout, "net": tin - tout}
-        }
+            result["per_day"] = [dict(r) for r in per_day]
+            return result
     except Exception as e:
         return {"error":"db_failed_analytics","detail":str(e)}
-
