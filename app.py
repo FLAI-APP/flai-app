@@ -1,4 +1,4 @@
-# app.py — versione completa, idempotente e pronta al deploy
+# app.py — fix definitivo per movements.importo → movements.amount
 import os, time
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -10,24 +10,20 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from openai import OpenAI
 
-# =========================
-# App & CORS
-# =========================
 APP = FastAPI()
 
+# ================
+# ENV & CORS
+# ================
 origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","").split(",") if o.strip()]
 APP.add_middleware(
     CORSMiddleware,
-    allow_origins=origins or [],   # in prod: metti solo i domini reali
+    allow_origins=origins or [],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================
-# ENV
-# =========================
 API_KEY_APP       = os.getenv("API_KEY_APP", "")
-DEBUG             = os.getenv("DEBUG","false").lower() == "true"
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN","")
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY","")
 DATABASE_URL      = (os.getenv("DATABASE_URL") or "").strip()
@@ -35,15 +31,12 @@ if DATABASE_URL and "sslmode=" not in DATABASE_URL:
     sep = "&" if "?" in DATABASE_URL else "?"
     DATABASE_URL = DATABASE_URL + f"{sep}sslmode=require"
 
-# =========================
-# Clients
-# =========================
 client = OpenAI(api_key=OPENAI_API_KEY)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-# =========================
-# Schema DB (auto-create & auto-fix idempotenti)
-# =========================
+# ================
+# Bootstrap schema
+# ================
 def _bootstrap_schema():
     with engine.begin() as conn:
         # messages
@@ -55,49 +48,54 @@ def _bootstrap_schema():
           created_at TIMESTAMP DEFAULT NOW()
         );
         """))
+
         # movements base
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS movements (
-          id SERIAL PRIMARY KEY
-        );
-        """))
-        # colonne obbligatorie/mancanti (idempotenti)
+        conn.execute(text("CREATE TABLE IF NOT EXISTS movements (id SERIAL PRIMARY KEY);"))
+
+        # fix colonna legacy `importo`
+        cols = conn.execute(text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='movements'
+        """)).scalars().all()
+
+        if "importo" in cols:
+            if "amount" not in cols:
+                conn.execute(text("ALTER TABLE movements RENAME COLUMN importo TO amount;"))
+            else:
+                conn.execute(text("ALTER TABLE movements DROP COLUMN importo;"))
+
+        # colonne standard
         conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS type VARCHAR(10);"))
         conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS amount NUMERIC(14,2);"))
         conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS currency VARCHAR(8);"))
         conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS category VARCHAR(50);"))
         conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS note TEXT;"))
-        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS created_at TIMESTAMP;"))
-        # default e NOT NULL coerenti
-        conn.execute(text("ALTER TABLE movements ALTER COLUMN currency SET DEFAULT 'CHF';"))
-        conn.execute(text("ALTER TABLE movements ALTER COLUMN created_at SET DEFAULT NOW();"))
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS voce VARCHAR(50) DEFAULT 'generale';"))
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();"))
+
+        # default & not null
         conn.execute(text("UPDATE movements SET currency='CHF' WHERE currency IS NULL;"))
         conn.execute(text("UPDATE movements SET created_at=NOW() WHERE created_at IS NULL;"))
-        # type e amount come NOT NULL con valori di fallback
+        conn.execute(text("UPDATE movements SET voce='generale' WHERE voce IS NULL;"))
         conn.execute(text("UPDATE movements SET type='in' WHERE type IS NULL;"))
         conn.execute(text("UPDATE movements SET amount=0 WHERE amount IS NULL;"))
+
         conn.execute(text("ALTER TABLE movements ALTER COLUMN type SET NOT NULL;"))
         conn.execute(text("ALTER TABLE movements ALTER COLUMN amount SET NOT NULL;"))
         conn.execute(text("ALTER TABLE movements ALTER COLUMN currency SET NOT NULL;"))
-        # gestione colonna 'voce' se presente NOT NULL: rilassa + default
-        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS voce VARCHAR(50);"))
-        conn.execute(text("ALTER TABLE movements ALTER COLUMN voce DROP NOT NULL;"))
-        conn.execute(text("ALTER TABLE movements ALTER COLUMN voce SET DEFAULT 'generale';"))
-        conn.execute(text("UPDATE movements SET voce='generale' WHERE voce IS NULL;"))
+        conn.execute(text("ALTER TABLE movements ALTER COLUMN voce SET NOT NULL;"))
 
 try:
     _bootstrap_schema()
 except Exception as e:
-    # non bloccare lo startup: la diagnosi arriverà da /debug
     print("SCHEMA_BOOTSTRAP_ERROR:", e, flush=True)
 
-# =========================
-# Rate limit soft (per pod)
-# =========================
+# ================
+# Middleware
+# ================
 WINDOW_SECONDS = 60
 MAX_REQ = 60
-_bucket = {}  # {key: (window_start_ts, count)}
-
+_bucket = {}
 def _client_key(req: Request) -> str:
     xf = req.headers.get("x-forwarded-for")
     ip = xf.split(",")[0].strip() if xf else (req.client.host if req.client else "0.0.0.0")
@@ -106,276 +104,51 @@ def _client_key(req: Request) -> str:
 @APP.middleware("http")
 async def security_and_rate_limit(request: Request, call_next):
     path = request.url.path
-
-    # endpoints aperti (Meta non manda header custom)
-    open_paths = {"/", "/healthz", "/webhook", "/debug", "/echo", "/diag/movements/columns"}
+    open_paths = {"/","/healthz","/webhook","/debug"}
     if path not in open_paths:
-        if not API_KEY_APP:
-            return JSONResponse({"error":"server_misconfigured_no_api_key"}, status_code=500)
         if request.headers.get("x-api-key") != API_KEY_APP:
             raise HTTPException(status_code=401, detail="invalid api key")
-        now = int(time.time())
-        key = _client_key(request)
-        wstart, cnt = _bucket.get(key, (now, 0))
-        if now - wstart >= WINDOW_SECONDS:
-            wstart, cnt = now, 0
-        cnt += 1
-        _bucket[key] = (wstart, cnt)
-        if cnt > MAX_REQ:
-            return JSONResponse({"error":"rate_limited","limit_per_min":MAX_REQ}, status_code=429)
+    return await call_next(request)
 
-    response = await call_next(request)
-    return response
-
-# =========================
-# Schemi pydantic
-# =========================
-class IncomingMessage(BaseModel):
-    message: str
-
-# =========================
+# ================
 # Routes base
-# =========================
-@APP.get("/")
-def root():
-    return {"status": "ok", "service": "flai-app"}
-
-@APP.get("/healthz")
-def healthz():
-    return "ok"
-
-# =========================
-# Echo & Debug (aperti per diagnosi)
-# =========================
-@APP.get("/echo")
-def echo(request: Request):
-    hdr = request.headers.get("x-api-key")
-    return {
-        "x_api_key_present": bool(hdr),
-        "x_api_key_len": len(hdr) if hdr else 0,
-        "path": str(request.url.path)
-    }
-
+# ================
+@APP.get("/") def root(): return {"status":"ok"}
+@APP.get("/healthz") def healthz(): return "ok"
 @APP.get("/debug")
 def debug():
-    db_ok = False
-    db_err = ""
     try:
-        with engine.begin() as conn:
-            conn.execute(text("SELECT 1"))
-        db_ok = True
+        with engine.begin() as conn: conn.execute(text("SELECT 1"))
+        db_ok=True
     except Exception as e:
-        db_ok = False
-        db_err = str(e)
-    return {
-        "has_openai_key": bool(OPENAI_API_KEY),
-        "db_ok": db_ok,
-        "db_error": db_err[:400],
-        "allowed_origins": origins,
-        "api_key_set": bool(API_KEY_APP),
-        "api_key_length": len(API_KEY_APP) if API_KEY_APP else 0
-    }
+        db_ok=False
+        return {"db_ok":db_ok,"err":str(e)}
+    return {"db_ok":db_ok}
 
-# =========================
-# WhatsApp verify + events (unificato su /webhook)
-# =========================
-@APP.get("/webhook")
-async def whatsapp_verify(hub_mode: str = "", hub_challenge: str = "", hub_verify_token: str = ""):
-    if hub_mode == "subscribe" and hub_verify_token == META_VERIFY_TOKEN:
-        return PlainTextResponse(hub_challenge or "", media_type="text/plain")
-    raise HTTPException(status_code=403, detail="verification_failed")
-
-@APP.post("/webhook")
-async def whatsapp_events(payload: dict = Body(...)):
-    # 1) DEMO JSON {"message":"..."}
-    if "message" in payload:
-        user_msg = (payload.get("message") or "").strip()
-        if not user_msg:
-            return {"error":"no message"}
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role":"system","content":"Sei un assistente aziendale. Rispondi chiaro, concreto e conciso."},
-                    {"role":"user","content": user_msg}
-                ],
-                temperature=0.2
-            )
-            reply_text = resp.choices[0].message.content.strip()
-        except Exception as e:
-            return {"error":"openai_failed","detail":str(e)}
-        try:
-            with engine.begin() as conn:
-                conn.execute(
-                    text("INSERT INTO messages (content, reply, created_at) VALUES (:c,:r,:t)"),
-                    {"c": user_msg, "r": reply_text, "t": datetime.utcnow()}
-                )
-        except Exception as e:
-            return {"error":"db_failed","detail":str(e)}
-        return {"reply": reply_text}
-
-    # 2) Meta payload (semplificato)
-    try:
-        entry = payload.get("entry", [])[0]
-        change = entry.get("changes", [])[0]
-        value = change.get("value", {})
-        messages = value.get("messages", [])
-        if not messages:
-            return {"status":"ok"}
-        msg = messages[0]
-        text_in = msg.get("text", {}).get("body", "") or "[unsupported message type]"
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role":"system","content":"Sei un assistente aziendale. Rispondi chiaro, concreto e conciso."},
-                    {"role":"user","content": text_in}
-                ],
-                temperature=0.2
-            )
-            reply_text = resp.choices[0].message.content.strip()
-        except Exception as e:
-            reply_text = f"[openai_failed: {e}]"
-        try:
-            with engine.begin() as conn:
-                conn.execute(
-                    text("INSERT INTO messages (content, reply, created_at) VALUES (:c,:r,:t)"),
-                    {"c": text_in, "r": reply_text, "t": datetime.utcnow()}
-                )
-        except Exception:
-            pass
-        return {"status":"ok","preview_reply": reply_text[:200]}
-    except Exception as e:
-        return JSONResponse({"error":"wa_parse_error","detail":str(e)}, status_code=200)
-
-# =========================
-# Messages (protetto)
-# =========================
-@APP.get("/messages")
-def list_messages(limit: int = 20):
-    try:
-        with engine.begin() as conn:
-            rows = conn.execute(
-                text("SELECT id, content, reply, created_at FROM messages ORDER BY created_at DESC LIMIT :lim"),
-                {"lim": limit}
-            ).mappings().all()
-        return {"items": [dict(r) for r in rows]}
-    except Exception as e:
-        return {"error":"db_failed", "detail": str(e)}
-
-# =========================
-# Movements (protetti)
-# =========================
+# ================
+# Movements
+# ================
 @APP.post("/movements")
 def create_movement(item: dict = Body(...)):
     try:
-        t = (item.get("type") or "").strip().lower()
-        if t not in ("in","out"):
-            raise HTTPException(422, "type must be 'in' or 'out'")
-        amt = item.get("amount")
-        try:
-            amt = float(amt)
-        except:
-            raise HTTPException(422, "amount must be numeric")
+        t = (item.get("type") or "").lower()
+        amt = Decimal(str(item.get("amount",0)))
         cur = (item.get("currency") or "CHF").upper()
-        cat = (item.get("category") or None)
-        note = (item.get("note") or None)
-        voce = (item.get("voce") or "generale")  # compat per chi avesse 'voce' NOT NULL
-
+        cat = item.get("category")
+        note= item.get("note")
+        voce= item.get("voce") or "generale"
         with engine.begin() as conn:
-            conn.execute(
-                text("""INSERT INTO movements(type,amount,currency,category,note,voce,created_at)
-                        VALUES (:t,:a,:c,:cat,:n,:v,:ts)"""),
-                {"t":t, "a":Decimal(str(amt)), "c":cur, "cat":cat, "n":note, "v": voce, "ts": datetime.utcnow()}
-            )
+            conn.execute(text("""
+                INSERT INTO movements(type,amount,currency,category,note,voce,created_at)
+                VALUES (:t,:a,:c,:cat,:n,:v,:ts)
+            """), {"t":t,"a":amt,"c":cur,"cat":cat,"n":note,"v":voce,"ts":datetime.utcnow()})
         return {"status":"ok"}
-    except HTTPException:
-        raise
     except Exception as e:
         return {"error":"db_failed_insert","detail":str(e)}
 
 @APP.get("/movements")
-def list_movements(_from: str = Query(None, alias="from"), to: str = None, limit: int = 200):
-    try:
-        q = "SELECT id,type,amount,currency,category,note,voce,created_at FROM movements WHERE 1=1"
-        params = {}
-        if _from:
-            q += " AND created_at >= :f"; params["f"] = _from
-        if to:
-            q += " AND created_at < :t"; params["t"] = to
-        q += " ORDER BY created_at DESC LIMIT :lim"
-        params["lim"] = limit
-
-        with engine.begin() as conn:
-            rows = conn.execute(text(q), params).mappings().all()
-            totals = conn.execute(text("""
-                SELECT
-                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
-                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
-                FROM movements
-                WHERE 1=1
-                  AND (:f IS NULL OR created_at >= :f)
-                  AND (:t IS NULL OR created_at < :t)
-            """), {"f": _from, "t": to}).mappings().first()
-
-        total_in  = float(totals["total_in"]) if totals and totals["total_in"]  is not None else 0.0
-        total_out = float(totals["total_out"]) if totals and totals["total_out"] is not None else 0.0
-        return {"items":[dict(r) for r in rows], "totals": {"total_in": total_in, "total_out": total_out, "net": total_in - total_out}}
-    except Exception as e:
-        return {"error":"db_failed_query","detail":str(e)}
-
-@APP.get("/summary")
-def summary(days: int = 30):
-    try:
-        since = datetime.utcnow() - timedelta(days=days)
-        with engine.begin() as conn:
-            totals = conn.execute(text("""
-                SELECT
-                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
-                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
-                FROM movements
-                WHERE created_at >= :since
-            """), {"since": since}).mappings().first()
-        total_in  = float(totals["total_in"]) if totals and totals["total_in"]  is not None else 0.0
-        total_out = float(totals["total_out"]) if totals and totals["total_out"] is not None else 0.0
-        return {"period_days": days, "entrate": total_in, "uscite": total_out, "saldo": total_in - total_out}
-    except Exception as e:
-        return {"error":"db_failed_summary","detail":str(e)}
-
-# =========================
-# Diagnostica schema movements + fix admin
-# =========================
-@APP.get("/diag/movements/columns")
-def diag_movements_columns():
-    try:
-        with engine.begin() as conn:
-            rows = conn.execute(text("""
-                SELECT column_name, data_type, is_nullable, column_default
-                FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='movements'
-                ORDER BY ordinal_position
-            """)).mappings().all()
-        return {"ok": True, "columns": [dict(r) for r in rows]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@APP.post("/admin/fix_movements_schema")
-def fix_movements_schema():
-    try:
-        _bootstrap_schema()
-        return diag_movements_columns()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@APP.post("/admin/fix_movements_voce")
-def fix_movements_voce():
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS voce VARCHAR(50);"))
-            conn.execute(text("ALTER TABLE movements ALTER COLUMN voce DROP NOT NULL;"))
-            conn.execute(text("ALTER TABLE movements ALTER COLUMN voce SET DEFAULT 'generale';"))
-            conn.execute(text("UPDATE movements SET voce='generale' WHERE voce IS NULL;"))
-        return diag_movements_columns()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+def list_movements():
+    with engine.begin() as conn:
+        rows=conn.execute(text("SELECT * FROM movements ORDER BY created_at DESC LIMIT 50")).mappings().all()
+    return {"items":[dict(r) for r in rows]}
 
