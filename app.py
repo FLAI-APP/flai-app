@@ -1,21 +1,17 @@
-# app.py — fix definitivo per movements.importo → movements.amount
-import os, time
-from datetime import datetime, timedelta
+# app.py — versione minimale stabile (DB fix movements + API)
+import os
+from datetime import datetime
 from decimal import Decimal
 
-from fastapi import FastAPI, Request, HTTPException, Query, Body
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request, HTTPException, Body, Query
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from sqlalchemy import create_engine, text
-from openai import OpenAI
 
 APP = FastAPI()
 
-# ================
-# ENV & CORS
-# ================
-origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","").split(",") if o.strip()]
+# -------- CORS --------
+origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 APP.add_middleware(
     CORSMiddleware,
     allow_origins=origins or [],
@@ -23,66 +19,57 @@ APP.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY_APP       = os.getenv("API_KEY_APP", "")
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN","")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY","")
-DATABASE_URL      = (os.getenv("DATABASE_URL") or "").strip()
+# -------- ENV & DB --------
+API_KEY_APP  = os.getenv("API_KEY_APP", "")
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 if DATABASE_URL and "sslmode=" not in DATABASE_URL:
     sep = "&" if "?" in DATABASE_URL else "?"
     DATABASE_URL = DATABASE_URL + f"{sep}sslmode=require"
 
-client = OpenAI(api_key=OPENAI_API_KEY)
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-# ================
-# Bootstrap schema
-# ================
+# -------- Bootstrap schema (idempotente) --------
 def _bootstrap_schema():
     with engine.begin() as conn:
-        # messages
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS messages (
-          id SERIAL PRIMARY KEY,
-          content   TEXT NOT NULL,
-          reply     TEXT,
-          created_at TIMESTAMP DEFAULT NOW()
-        );
-        """))
-
-        # movements base
+        # crea tabella base se manca
         conn.execute(text("CREATE TABLE IF NOT EXISTS movements (id SERIAL PRIMARY KEY);"))
 
-        # fix colonna legacy `importo`
+        # colonne presenti
         cols = conn.execute(text("""
-            SELECT column_name FROM information_schema.columns
+            SELECT column_name
+            FROM information_schema.columns
             WHERE table_schema='public' AND table_name='movements'
         """)).scalars().all()
 
+        # rinomina 'importo' -> 'amount' oppure drop se amount esiste già
         if "importo" in cols:
             if "amount" not in cols:
                 conn.execute(text("ALTER TABLE movements RENAME COLUMN importo TO amount;"))
+                cols = [("amount" if c == "importo" else c) for c in cols]
             else:
                 conn.execute(text("ALTER TABLE movements DROP COLUMN importo;"))
+                cols = [c for c in cols if c != "importo"]
 
-        # colonne standard
+        # aggiungi colonne standard se mancano
         conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS type VARCHAR(10);"))
         conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS amount NUMERIC(14,2);"))
         conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS currency VARCHAR(8);"))
         conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS category VARCHAR(50);"))
         conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS note TEXT;"))
-        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS voce VARCHAR(50) DEFAULT 'generale';"))
-        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();"))
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS voce VARCHAR(50);"))
+        conn.execute(text("ALTER TABLE movements ADD COLUMN IF NOT EXISTS created_at TIMESTAMP;"))
 
-        # default & not null
+        # default + valori di sicurezza
         conn.execute(text("UPDATE movements SET currency='CHF' WHERE currency IS NULL;"))
         conn.execute(text("UPDATE movements SET created_at=NOW() WHERE created_at IS NULL;"))
         conn.execute(text("UPDATE movements SET voce='generale' WHERE voce IS NULL;"))
         conn.execute(text("UPDATE movements SET type='in' WHERE type IS NULL;"))
         conn.execute(text("UPDATE movements SET amount=0 WHERE amount IS NULL;"))
 
+        # vincoli coerenti
+        conn.execute(text("ALTER TABLE movements ALTER COLUMN currency SET NOT NULL;"))
         conn.execute(text("ALTER TABLE movements ALTER COLUMN type SET NOT NULL;"))
         conn.execute(text("ALTER TABLE movements ALTER COLUMN amount SET NOT NULL;"))
-        conn.execute(text("ALTER TABLE movements ALTER COLUMN currency SET NOT NULL;"))
         conn.execute(text("ALTER TABLE movements ALTER COLUMN voce SET NOT NULL;"))
 
 try:
@@ -90,65 +77,72 @@ try:
 except Exception as e:
     print("SCHEMA_BOOTSTRAP_ERROR:", e, flush=True)
 
-# ================
-# Middleware
-# ================
-WINDOW_SECONDS = 60
-MAX_REQ = 60
-_bucket = {}
-def _client_key(req: Request) -> str:
-    xf = req.headers.get("x-forwarded-for")
-    ip = xf.split(",")[0].strip() if xf else (req.client.host if req.client else "0.0.0.0")
-    return ip + "|" + (req.headers.get("x-api-key") or "-")
-
+# -------- Middleware API key (solo per percorsi protetti) --------
 @APP.middleware("http")
-async def security_and_rate_limit(request: Request, call_next):
-    path = request.url.path
-    open_paths = {"/","/healthz","/webhook","/debug"}
-    if path not in open_paths:
+async def api_key_guard(request: Request, call_next):
+    open_paths = {"/", "/healthz", "/debug"}  # liberi
+    if request.url.path not in open_paths:
         if request.headers.get("x-api-key") != API_KEY_APP:
             raise HTTPException(status_code=401, detail="invalid api key")
     return await call_next(request)
 
-# ================
-# Routes base
-# ================
-@APP.get("/") def root(): return {"status":"ok"}
-@APP.get("/healthz") def healthz(): return "ok"
+# -------- Routes base --------
+@APP.get("/")
+def root():
+    return {"status": "ok", "service": "flai-app"}
+
+@APP.get("/healthz")
+def healthz():
+    return "ok"
+
 @APP.get("/debug")
 def debug():
     try:
-        with engine.begin() as conn: conn.execute(text("SELECT 1"))
-        db_ok=True
+        with engine.begin() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"db_ok": True}
     except Exception as e:
-        db_ok=False
-        return {"db_ok":db_ok,"err":str(e)}
-    return {"db_ok":db_ok}
+        return {"db_ok": False, "err": str(e)}
 
-# ================
-# Movements
-# ================
+# -------- Movements --------
 @APP.post("/movements")
 def create_movement(item: dict = Body(...)):
     try:
-        t = (item.get("type") or "").lower()
-        amt = Decimal(str(item.get("amount",0)))
+        t = (item.get("type") or "").strip().lower()
+        if t not in ("in", "out"):
+            raise HTTPException(422, "type must be 'in' or 'out'")
+        amt = Decimal(str(item.get("amount", 0)))
         cur = (item.get("currency") or "CHF").upper()
         cat = item.get("category")
-        note= item.get("note")
-        voce= item.get("voce") or "generale"
+        note = item.get("note")
+        voce = item.get("voce") or "generale"
+
         with engine.begin() as conn:
             conn.execute(text("""
-                INSERT INTO movements(type,amount,currency,category,note,voce,created_at)
-                VALUES (:t,:a,:c,:cat,:n,:v,:ts)
-            """), {"t":t,"a":amt,"c":cur,"cat":cat,"n":note,"v":voce,"ts":datetime.utcnow()})
-        return {"status":"ok"}
+                INSERT INTO movements(type, amount, currency, category, note, voce, created_at)
+                VALUES (:t, :a, :c, :cat, :n, :v, :ts)
+            """), {"t": t, "a": amt, "c": cur, "cat": cat, "n": note, "v": voce, "ts": datetime.utcnow()})
+        return {"status": "ok"}
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error":"db_failed_insert","detail":str(e)}
+        return {"error": "db_failed_insert", "detail": str(e)}
 
 @APP.get("/movements")
-def list_movements():
-    with engine.begin() as conn:
-        rows=conn.execute(text("SELECT * FROM movements ORDER BY created_at DESC LIMIT 50")).mappings().all()
-    return {"items":[dict(r) for r in rows]}
+def list_movements(_from: str = Query(None, alias="from"), to: str = None, limit: int = 200):
+    try:
+        q = "SELECT id, type, amount, currency, category, note, voce, created_at FROM movements WHERE 1=1"
+        params = {}
+        if _from:
+            q += " AND created_at >= :f"; params["f"] = _from
+        if to:
+            q += " AND created_at < :t"; params["t"] = to
+        q += " ORDER BY created_at DESC LIMIT :lim"
+        params["lim"] = limit
+
+        with engine.begin() as conn:
+            rows = conn.execute(text(q), params).mappings().all()
+        return {"items": [dict(r) for r in rows]}
+    except Exception as e:
+        return {"error": "db_failed_query", "detail": str(e)}
 
