@@ -183,7 +183,7 @@ def bulk_movements(items: list[dict] = Body(...)):
     except Exception as e:
         return {"error":"db_failed_bulk","detail":str(e)}
 
-# -------- Analytics: overview per giorno --------
+
 @APP.get("/analytics/overview")
 def analytics_overview(days: int = 30):
     """
@@ -196,11 +196,10 @@ def analytics_overview(days: int = 30):
 
     try:
         with engine.begin() as conn:
-            # serie date
             per_day = conn.execute(text("""
                 WITH days AS (
                   SELECT generate_series(
-                    (CURRENT_DATE - (:d::int - 1) * INTERVAL '1 day')::date,
+                    (CURRENT_DATE - ((CAST(:d AS integer) - 1) * INTERVAL '1 day'))::date,
                     CURRENT_DATE::date,
                     INTERVAL '1 day'
                   )::date AS d
@@ -211,7 +210,7 @@ def analytics_overview(days: int = 30):
                     COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS in_amt,
                     COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS out_amt
                   FROM movements
-                  WHERE created_at >= CURRENT_DATE - (:d::int - 1) * INTERVAL '1 day'
+                  WHERE created_at >= CURRENT_DATE - ((CAST(:d AS integer) - 1) * INTERVAL '1 day')
                   GROUP BY DATE(created_at)
                 )
                 SELECT
@@ -229,7 +228,7 @@ def analytics_overview(days: int = 30):
                   COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
                   COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
                 FROM movements
-                WHERE created_at >= CURRENT_DATE - (:d::int - 1) * INTERVAL '1 day'
+                WHERE created_at >= CURRENT_DATE - ((CAST(:d AS integer) - 1) * INTERVAL '1 day')
             """), {"d": days}).mappings().first()
 
         tin  = float(totals["total_in"]  or 0)
