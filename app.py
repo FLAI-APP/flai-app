@@ -6,7 +6,7 @@ import psycopg2
 from fastapi import FastAPI, Request, Body, HTTPException
 from fastapi.responses import JSONResponse
 
-app = FastAPI()
+APP = FastAPI()
 
 # --- CONFIG ---
 DATABASE_URL = os.getenv("DATABASE_URL", "")
