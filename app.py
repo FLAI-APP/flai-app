@@ -1,24 +1,28 @@
-cat > app.py << 'PY'
-import os
-from datetime import datetime
+kimport os
+from datetime import datetime, timedelta
+
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import FastAPI, Request, Body, HTTPException, Query
-from fastapi.responses import JSONResponse
 
+from fastapi import FastAPI, Request, Body, HTTPException, Query
+from fastapi.responses import JSONResponse, PlainTextResponse
+
+# --- Config da ENV ---
 DB_URL = os.getenv("DATABASE_URL", "")
 API_KEY = os.getenv("API_KEY_APP", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 if not DB_URL:
-    raise RuntimeError("DATABASE_URL non impostata su Render → Environment")
-if not API_KEY:
-    print("⚠️  API_KEY_APP non impostata (Render → Environment). Gli endpoint resteranno protetti ma daranno 401.")
+    raise RuntimeError("DATABASE_URL non impostata (Render → Environment).")
 
+# Connessione DB
 def get_conn():
     return psycopg.connect(DB_URL, sslmode="require")
 
-APP = FastAPI(title="flai-app", version="1.0.0")
+# FastAPI app (ATTENZIONE: nome oggetto = APP)
+APP = FastAPI(title="flai-app", version="1.1.0")
 
+# --- Middleware semplice: API key su tutto tranne root/healthz ---
 @APP.middleware("http")
 async def auth(request: Request, call_next):
     if request.url.path not in ("/", "/healthz"):
@@ -26,6 +30,7 @@ async def auth(request: Request, call_next):
             return JSONResponse({"error": "invalid api key"}, status_code=401)
     return await call_next(request)
 
+# --- Root e Health ---
 @APP.get("/")
 def root():
     return {"ok": True, "service": "flai-app", "time": datetime.utcnow().isoformat()}
@@ -41,6 +46,22 @@ def healthz():
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
+# --- Movements: crea tabella se manca, INSERT, LIST ---
+def _ensure_movements(conn):
+    with conn.cursor() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS movements(
+              id SERIAL PRIMARY KEY,
+              type TEXT NOT NULL,                         -- "in" | "out"
+              amount NUMERIC(12,2),                       -- importo
+              currency TEXT,                              -- es. CHF
+              category TEXT,                              -- es. sales, fornitori
+              note TEXT,
+              voce TEXT,
+              created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+            )
+        """)
+
 @APP.post("/movements")
 def create_movement(item: dict = Body(...)):
     try:
@@ -54,22 +75,11 @@ def create_movement(item: dict = Body(...)):
         voce = item.get("voce") or "generale"
 
         with get_conn() as conn:
+            _ensure_movements(conn)
             with conn.cursor() as c:
                 c.execute("""
-                    CREATE TABLE IF NOT EXISTS movements(
-                      id SERIAL PRIMARY KEY,
-                      type TEXT NOT NULL,
-                      amount NUMERIC(12,2),
-                      currency TEXT,
-                      category TEXT,
-                      note TEXT,
-                      voce TEXT,
-                      created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
-                    )
-                """)
-                c.execute("""
                     INSERT INTO movements(type, amount, currency, category, note, voce, created_at)
-                    VALUES (%s,%s,%s,%s,%s,%s, NOW())
+                    VALUES (%s,%s,%s,%s,%s,%s,NOW())
                     RETURNING id
                 """, (t, amt, cur, cat, note, voce))
                 new_id = c.fetchone()[0]
@@ -81,6 +91,7 @@ def create_movement(item: dict = Body(...)):
 def list_movements(fr: str = Query(None, alias="from"), to: str = None, limit: int = 200):
     try:
         with get_conn() as conn:
+            _ensure_movements(conn)
             with conn.cursor(row_factory=dict_row) as c:
                 q = """
                     SELECT id, type, amount, currency, category, note, voce, created_at
@@ -95,6 +106,7 @@ def list_movements(fr: str = Query(None, alias="from"), to: str = None, limit: i
                 q += " ORDER BY created_at DESC LIMIT %s"; params.append(limit)
                 c.execute(q, params)
                 items = c.fetchall()
+
             with conn.cursor(row_factory=dict_row) as c2:
                 c2.execute("""
                     SELECT
@@ -109,10 +121,12 @@ def list_movements(fr: str = Query(None, alias="from"), to: str = None, limit: i
     except Exception as e:
         return JSONResponse({"error": "db_failed_query", "detail": str(e)}, status_code=500)
 
+# --- Summary numerico semplice ---
 @APP.post("/summaries/generate")
 def generate_summary(days: int = Query(30, ge=1, le=365)):
     try:
         with get_conn() as conn:
+            _ensure_movements(conn)
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("""
                     SELECT 
@@ -132,4 +146,46 @@ def generate_summary(days: int = Query(30, ge=1, le=365)):
         }
     except Exception as e:
         return JSONResponse({"error": "db_failed_summary", "detail": str(e)}, status_code=500)
-PY
+
+# --- Summary in linguaggio naturale con OpenAI ---
+def _openai_summary_text(total_in: float, total_out: float, net: float, days: int) -> str:
+    """
+    Chiamata minimale all'API OpenAI (SDK 1.x).
+    Evito dipendenze strane: un prompt semplice e robusto.
+    """
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        prompt = (
+            f"Riassumi in italiano l'andamento degli ultimi {days} giorni.\n"
+            f"Entrate: {total_in:.2f} CHF. Uscite: {total_out:.2f} CHF. "
+            f"Saldo netto: {net:.2f} CHF.\n"
+            "Sii conciso (3-5 frasi), pratico, e indica 1-2 azioni consigliate."
+        )
+        chat = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.3,
+            max_tokens=200
+        )
+        return (chat.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"(fallback) Andamento ultimi {days} giorni: entrate {total_in:.2f} CHF, uscite {total_out:.2f} CHF, netto {net:.2f} CHF. (Errore OpenAI: {e})"
+
+@APP.post("/summaries/text")
+def summary_text(days: int = Query(30, ge=1, le=365)):
+    """
+    Combina i KPI numerici con un riassunto in linguaggio naturale.
+    """
+    try:
+        base = generate_summary(days)  # riusa la funzione sopra
+        if isinstance(base, JSONResponse):
+            # errore numerico
+            return base
+        total_in = base["in"]
+        total_out = base["out"]
+        net = base["net"]
+        text = _openai_summary_text(total_in, total_out, net, days)
+        return {"kpi": base, "text": text}
+    except Exception as e:
+        return JSONResponse({"error":"text_summary_failed","detail":str(e)}, status_code=500)
