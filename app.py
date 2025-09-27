@@ -1,10 +1,10 @@
-# app.py — piani + tenants + quota (compatibile con endpoints esistenti)
-import os
+# app.py — piani+tenant+quota + analytics + REPORT CSV
+import os, json, io, csv
 from datetime import datetime, date
 from decimal import Decimal
 
 from fastapi import FastAPI, Request, HTTPException, Body, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 
@@ -33,7 +33,7 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 # =========================================
 def _bootstrap_schema():
     with engine.begin() as conn:
-        # MOVEMENTS (come prima)
+        # MOVEMENTS
         conn.execute(text("CREATE TABLE IF NOT EXISTS movements (id SERIAL PRIMARY KEY);"))
         cols = conn.execute(text("""
             SELECT column_name FROM information_schema.columns
@@ -62,33 +62,33 @@ def _bootstrap_schema():
         conn.execute(text("ALTER TABLE movements ALTER COLUMN amount SET NOT NULL;"))
         conn.execute(text("ALTER TABLE movements ALTER COLUMN voce SET NOT NULL;"))
 
-        # PLANS (piani)
+        # PLANS
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS plans (
               id SERIAL PRIMARY KEY,
               name VARCHAR(30) UNIQUE NOT NULL,
-              monthly_limit INTEGER NOT NULL,    -- richieste/mese
-              features TEXT                      -- JSON opzionale (stringa)
+              monthly_limit INTEGER NOT NULL,
+              features TEXT
             );
         """))
 
-        # TENANTS (clienti)
+        # TENANTS
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS tenants (
               id SERIAL PRIMARY KEY,
               name VARCHAR(120) NOT NULL,
               plan_id INTEGER NOT NULL REFERENCES plans(id),
-              tenant_key VARCHAR(64) UNIQUE NOT NULL,  -- chiave usata dal cliente (X-Tenant-Key)
+              tenant_key VARCHAR(64) UNIQUE NOT NULL,
               created_at TIMESTAMP DEFAULT NOW()
             );
         """))
 
-        # QUOTAS (consumi per mese)
+        # QUOTAS
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS quotas (
               id SERIAL PRIMARY KEY,
               tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-              period VARCHAR(7) NOT NULL,              -- es. '2025-09'
+              period VARCHAR(7) NOT NULL,
               used_requests INTEGER NOT NULL DEFAULT 0,
               UNIQUE (tenant_id, period)
             );
@@ -115,7 +115,8 @@ def _get_tenant_and_plan(tenant_key: str):
         raise HTTPException(400, "X-Tenant-Key missing")
     with engine.begin() as conn:
         row = conn.execute(text("""
-            SELECT t.id AS tenant_id, t.name AS tenant_name, p.id AS plan_id, p.name AS plan_name, p.monthly_limit
+            SELECT t.id AS tenant_id, t.name AS tenant_name,
+                   p.id AS plan_id, p.name AS plan_name, p.monthly_limit, p.features
             FROM tenants t
             JOIN plans p ON p.id = t.plan_id
             WHERE t.tenant_key = :k
@@ -124,10 +125,22 @@ def _get_tenant_and_plan(tenant_key: str):
         raise HTTPException(401, "tenant not found / invalid tenant key")
     return row
 
+def _features_dict(plan_features_text: str) -> dict:
+    if not plan_features_text:
+        return {}
+    try:
+        return json.loads(plan_features_text)
+    except Exception:
+        return {}
+
+def _feature_enabled(tinfo, feature: str) -> bool:
+    feats = _features_dict(tinfo.get("features"))
+    val = feats.get(feature)
+    return bool(val)
+
 def _enforce_and_count_quota(tenant_id: int, plan_limit: int, increment: int = 1):
     period = _period_now()
     with engine.begin() as conn:
-        # ensure row
         conn.execute(text("""
             INSERT INTO quotas(tenant_id, period, used_requests)
             VALUES (:tid, :p, 0)
@@ -147,7 +160,7 @@ def _enforce_and_count_quota(tenant_id: int, plan_limit: int, increment: int = 1
         """), {"inc": increment, "tid": tenant_id, "p": period})
 
 # =========================================
-# Middleware: protezione per API key (admin) e tenant key (client)
+# Middleware
 # =========================================
 @APP.middleware("http")
 async def guard(request: Request, call_next):
@@ -155,19 +168,15 @@ async def guard(request: Request, call_next):
     open_paths = {"/", "/healthz", "/debug"}
     admin_paths = {"/admin/seed_plans", "/admin/create_tenant", "/admin/quotas"}
 
-    # admin endpoints: richiedono X-API-Key
     if path in admin_paths:
         _require_api_key(request)
         return await call_next(request)
 
-    # endpoints protetti lato cliente (richiedono X-Tenant-Key + contano quota)
-    client_protected_prefixes = ("/movements", "/analytics", "/summaries")
+    client_protected_prefixes = ("/movements", "/analytics", "/summaries", "/reports")
     if path.startswith(client_protected_prefixes):
-        # tenant key è richiesta e quota si conta dentro i singoli handler
         if not request.headers.get("x-tenant-key"):
             return JSONResponse({"error":"missing_tenant_key"}, status_code=401)
 
-    # open
     return await call_next(request)
 
 # =========================================
@@ -192,19 +201,13 @@ def debug():
     return {"db_ok": dbok}
 
 # =========================================
-# ADMIN endpoints (setup piani/tenant/quote)
+# ADMIN endpoints
 # =========================================
 @APP.post("/admin/seed_plans")
 def admin_seed_plans():
-    """
-    Crea/aggiorna piani Base/Pro/Premium.
-    Base: 1000 req/mese
-    Pro:  10000 req/mese
-    Premium: 100000 req/mese
-    """
     PLANS = [
-        ("Base", 1000,  '{"reports":false,"vision":false,"audio":false}'),
-        ("Pro",  10000, '{"reports":true,"vision":true,"audio":true}'),
+        ("Base",    1000,   '{"reports":false,"vision":false,"audio":false}'),
+        ("Pro",     10000,  '{"reports":true,"vision":true,"audio":true}'),
         ("Premium", 100000, '{"reports":true,"vision":true,"audio":true,"phone":true}')
     ]
     with engine.begin() as conn:
@@ -218,11 +221,6 @@ def admin_seed_plans():
 
 @APP.post("/admin/create_tenant")
 def admin_create_tenant(item: dict = Body(...)):
-    """
-    Body esempio:
-    { "name":"Ristorante Sole", "plan":"Pro", "tenant_key":"sole_ABC123" }
-    Se tenant_key non è fornita, la generiamo.
-    """
     name = (item.get("name") or "").strip()
     plan_name = (item.get("plan") or "Base").strip()
     tenant_key = (item.get("tenant_key") or f"tk_{int(datetime.utcnow().timestamp())}").strip()
@@ -250,12 +248,11 @@ def admin_quotas():
     return {"items": [dict(r) for r in rows]}
 
 # =========================================
-# Movements (protetti da X-Tenant-Key + quota)
+# Movements
 # =========================================
 @APP.post("/movements")
 def create_movement(request: Request, item: dict = Body(...)):
-    tenant_key = request.headers.get("x-tenant-key")
-    tinfo = _get_tenant_and_plan(tenant_key)
+    tinfo = _get_tenant_and_plan(request.headers.get("x-tenant-key"))
 
     try:
         t = (item.get("type") or "").strip().lower()
@@ -272,7 +269,6 @@ def create_movement(request: Request, item: dict = Body(...)):
                 INSERT INTO movements(type, amount, currency, category, note, voce, created_at)
                 VALUES (:t, :a, :c, :cat, :n, :v, :ts)
             """), {"t": t, "a": amt, "c": cur, "cat": cat, "n": note, "v": voce, "ts": datetime.utcnow()})
-        # 1 richiesta consumata
         _enforce_and_count_quota(tinfo["tenant_id"], tinfo["monthly_limit"], increment=1)
         return {"status": "ok"}
     except HTTPException:
@@ -282,8 +278,7 @@ def create_movement(request: Request, item: dict = Body(...)):
 
 @APP.get("/movements")
 def list_movements(request: Request, _from: str = Query(None, alias="from"), to: str = None, limit: int = 200):
-    tenant_key = request.headers.get("x-tenant-key")
-    tinfo = _get_tenant_and_plan(tenant_key)
+    tinfo = _get_tenant_and_plan(request.headers.get("x-tenant-key"))
 
     try:
         q = "SELECT id, type, amount, currency, category, note, voce, created_at FROM movements WHERE 1=1"
@@ -297,7 +292,6 @@ def list_movements(request: Request, _from: str = Query(None, alias="from"), to:
 
         with engine.begin() as conn:
             rows = conn.execute(text(q), params).mappings().all()
-        # 1 richiesta consumata
         _enforce_and_count_quota(tinfo["tenant_id"], tinfo["monthly_limit"], increment=1)
         return {"items": [dict(r) for r in rows]}
     except Exception as e:
@@ -305,8 +299,7 @@ def list_movements(request: Request, _from: str = Query(None, alias="from"), to:
 
 @APP.post("/movements/bulk")
 def bulk_movements(request: Request, items: list[dict] = Body(...)):
-    tenant_key = request.headers.get("x-tenant-key")
-    tinfo = _get_tenant_and_plan(tenant_key)
+    tinfo = _get_tenant_and_plan(request.headers.get("x-tenant-key"))
 
     try:
         if not isinstance(items, list) or not items:
@@ -329,7 +322,6 @@ def bulk_movements(request: Request, items: list[dict] = Body(...)):
                 INSERT INTO movements(type, amount, currency, category, note, voce, created_at)
                 SELECT :t, :a, :c, :cat, :n, :v, :ts
             """), to_insert)
-        # N richieste consumate = numero elementi (puoi cambiarlo a 1 se preferisci)
         _enforce_and_count_quota(tinfo["tenant_id"], tinfo["monthly_limit"], increment=len(to_insert))
         return {"status":"ok","inserted":len(to_insert)}
     except HTTPException:
@@ -338,12 +330,11 @@ def bulk_movements(request: Request, items: list[dict] = Body(...)):
         return {"error":"db_failed_bulk","detail":str(e)}
 
 # =========================================
-# Analytics (protetti) — compact totali
+# Analytics (compact per default)
 # =========================================
 @APP.get("/analytics/overview")
 def analytics_overview(request: Request, days: int = 30, compact: int = 1):
-    tenant_key = request.headers.get("x-tenant-key")
-    tinfo = _get_tenant_and_plan(tenant_key)
+    tinfo = _get_tenant_and_plan(request.headers.get("x-tenant-key"))
     if days <= 0 or days > 365:
         raise HTTPException(422, "days must be between 1 and 365")
 
@@ -359,12 +350,82 @@ def analytics_overview(request: Request, days: int = 30, compact: int = 1):
 
         tin  = float(totals["total_in"]  or 0)
         tout = float(totals["total_out"] or 0)
-        # quota: 1 richiesta
         _enforce_and_count_quota(tinfo["tenant_id"], tinfo["monthly_limit"], increment=1)
-        return {
-            "days": days,
-            "totals": {"in": tin, "out": tout, "net": tin - tout}
-        }
+        res = {"days": days, "totals": {"in": tin, "out": tout, "net": tin - tout}}
+        return res
     except Exception as e:
         return {"error":"db_failed_analytics","detail":str(e)}
+
+# =========================================
+# REPORTS (CSV)
+# =========================================
+def _ensure_reports_enabled(tinfo):
+    if not _feature_enabled(tinfo, "reports"):
+        raise HTTPException(403, f"plan '{tinfo['plan_name']}' does not include 'reports' feature")
+
+@APP.get("/reports/balance.summary")
+def report_summary(request: Request, days: int = 30):
+    tinfo = _get_tenant_and_plan(request.headers.get("x-tenant-key"))
+    _ensure_reports_enabled(tinfo)
+    if days <= 0 or days > 365:
+        raise HTTPException(422, "days must be between 1 and 365")
+
+    with engine.begin() as conn:
+        totals = conn.execute(text("""
+            SELECT
+              COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
+              COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
+            FROM movements
+            WHERE created_at >= CURRENT_DATE - ((CAST(:d AS integer) - 1) * INTERVAL '1 day')
+        """), {"d": days}).mappings().first()
+    tin  = float(totals["total_in"]  or 0)
+    tout = float(totals["total_out"] or 0)
+    _enforce_and_count_quota(tinfo["tenant_id"], tinfo["monthly_limit"], increment=1)
+    return {"days": days, "in": tin, "out": tout, "net": tin - tout}
+
+@APP.get("/reports/balance.csv")
+def report_csv(request: Request, days: int = 30):
+    tinfo = _get_tenant_and_plan(request.headers.get("x-tenant-key"))
+    _ensure_reports_enabled(tinfo)
+    if days <= 0 or days > 365:
+        raise HTTPException(422, "days must be between 1 and 365")
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT DATE(created_at) AS date, type, amount, currency, category, note, voce
+            FROM movements
+            WHERE created_at >= CURRENT_DATE - ((CAST(:d AS integer) - 1) * INTERVAL '1 day')
+            ORDER BY created_at ASC, id ASC
+        """), {"d": days}).mappings().all()
+        totals = conn.execute(text("""
+            SELECT
+              COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
+              COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
+            FROM movements
+            WHERE created_at >= CURRENT_DATE - ((CAST(:d AS integer) - 1) * INTERVAL '1 day')
+        """), {"d": days}).mappings().first()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["date","type","amount","currency","category","note","voce"])
+    for r in rows:
+        writer.writerow([
+            r["date"].isoformat() if r["date"] else "",
+            r["type"], f"{float(r['amount']):.2f}", r["currency"], r["category"] or "", r["note"] or "", r["voce"] or ""
+        ])
+    # riga totals alla fine
+    tin  = float(totals["total_in"]  or 0.0)
+    tout = float(totals["total_out"] or 0.0)
+    writer.writerow([])
+    writer.writerow(["TOTALS","","in:", f"{tin:.2f}", "out:", f"{tout:.2f}", "net:", f"{(tin-tout):.2f}"])
+
+    data = buf.getvalue().encode("utf-8")
+    filename = f"balance_{tinfo['tenant_name'].replace(' ','_')}_{_period_now()}_{days}d.csv"
+
+    _enforce_and_count_quota(tinfo["tenant_id"], tinfo["monthly_limit"], increment=1)
+    return Response(
+        content=data,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
 
