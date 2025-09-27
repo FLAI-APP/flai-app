@@ -1,0 +1,8 @@
+date,type,amount,currency,category,note,voce
+2025-09-26,in,2500.00,CHF,sales,incasso giorno,generale
+2025-09-26,out,1000.00,CHF,fornitori,hamburger,generale
+2025-09-26,in,1200.00,CHF,sales,giorno 1,generale
+2025-09-26,out,300.00,CHF,fornitori,pane,generale
+2025-09-27,in,500.00,CHF,sales,test quota,generale
+
+TOTALS,,in:,4200.00,out:,1300.00,net:,2900.00

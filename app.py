@@ -1,95 +1,49 @@
-import os
-import time
-import json
-import datetime
-import psycopg2
-from fastapi import FastAPI, Request, Body, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from datetime import datetime, timedelta
+import asyncpg
+import os
 
-APP = FastAPI()
+# Inizializza FastAPI
+app = FastAPI()
 
-# --- CONFIG ---
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-API_KEY_APP = os.getenv("API_KEY_APP", "")
+# Connessione al database (Render usa DATABASE_URL)
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- DB helper ---
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
-
-# --- Middleware sicurezza base ---
+# Middleware per autenticazione
 @app.middleware("http")
 async def check_api_key(request: Request, call_next):
-    if request.url.path not in ["/", "/healthz"]:
-        if request.headers.get("x-api-key") != API_KEY_APP:
-            return JSONResponse({"error": "invalid api key"}, status_code=401)
+    api_key = request.headers.get("X-API-Key")
+    valid_key = os.getenv("API_KEY", "flai_Chiasso13241")
+    if api_key != valid_key:
+        return JSONResponse(status_code=401, content={"error": "invalid_api_key"})
     return await call_next(request)
 
+# Endpoint di test base
 @app.get("/")
 async def root():
-    return {"ok": True}
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
-
-# --- Movements demo ---
-@app.post("/movements")
-async def create_movement(item: dict = Body(...)):
+# Endpoint esempio: riepilogo movimenti ultimi N giorni
+@app.get("/summaries/generate")
+async def generate_summary(days: int = 7):
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO movements(type, amount, currency, category, note, created_at)
-                    VALUES (%s,%s,%s,%s,%s,NOW())
-                """, (
-                    item.get("type"),
-                    item.get("amount"),
-                    item.get("currency","CHF"),
-                    item.get("category"),
-                    item.get("note")
-                ))
-        return {"status": "ok"}
-    except Exception as e:
-        return {"error": "db_failed_insert", "detail": str(e)}
+        conn = await asyncpg.connect(DATABASE_URL)
+        since = datetime.utcnow() - timedelta(days=days)
+        rows = await conn.fetch(
+            """
+            SELECT type, SUM(amount) as total
+            FROM movements
+            WHERE created_at >= $1
+            GROUP BY type
+            """,
+            since
+        )
+        await conn.close()
 
-@app.get("/movements")
-async def list_movements():
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, type, amount, currency, category, note, created_at
-                    FROM movements ORDER BY created_at DESC LIMIT 50
-                """)
-                rows = cur.fetchall()
-        return {"items": rows}
-    except Exception as e:
-        return {"error": "db_failed_query", "detail": str(e)}
+        summary = {row["type"]: float(row["total"]) for row in rows}
+        return {"days": days, "summary": summary}
 
-# --- Summaries molto semplice ---
-@app.post("/summaries/generate")
-async def generate_summary(days: int = 30):
-    """
-    Calcola entrate, uscite e netto ultimi N giorni.
-    """
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT 
-                      COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
-                      COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
-                    FROM movements
-                    WHERE created_at >= NOW() - INTERVAL '%s days'
-                """, (days,))
-                res = cur.fetchone()
-        total_in, total_out = res
-        return {
-            "window_days": days,
-            "in": float(total_in),
-            "out": float(total_out),
-            "net": float(total_in - total_out)
-        }
     except Exception as e:
         return {"error": "db_failed_summary", "detail": str(e)}
 
