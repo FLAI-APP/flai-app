@@ -1,397 +1,257 @@
 import os
 import json
-import time
-from datetime import datetime, timedelta
-from urllib.parse import urlparse
+import decimal
+from datetime import datetime
 
-from fastapi import FastAPI, Request, HTTPException, Body, Query
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse, PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
 
-import pg8000.dbapi as pg
-from decimal import Decimal
+# OpenAI SDK (>=1.40) – niente proxies custom
+try:
+    from openai import OpenAI
+    _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+except Exception as _e:
+    _openai_client = None
 
-# =========================
-# CONFIG / ENV
-# =========================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-DATABASE_URL   = os.getenv("DATABASE_URL", "")
-API_KEY_APP    = os.getenv("API_KEY_APP", "")
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "flai-verify-123")
-DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+APP = FastAPI()
 
-# =========================
-# FASTAPI
-# =========================
-app = FastAPI(title="flai-app")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS or [],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# -----------------------------
+# Helpers DB
+# -----------------------------
 
-# =========================
-# DB helper (pg8000)
-# =========================
-def _pg_params_from_url(db_url: str) -> dict:
-    """
-    Converte postgresql://user:pass@host:port/dbname in kwargs per pg8000.dbapi.connect
-    """
-    u = urlparse(db_url)
-    if u.scheme not in ("postgresql", "postgres"):
-        raise RuntimeError("DATABASE_URL must start with postgresql://")
-    return {
-        "user":     u.username,
-        "password": u.password,
-        "host":     u.hostname,
-        "port":     u.port or 5432,
-        "database": u.path.lstrip("/"),
-        "ssl_context": True,  # Render usa SSL
-    }
-
-def db_conn():
+def get_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not configured")
-    return pg.connect(**_pg_params_from_url(DATABASE_URL))
+        raise RuntimeError("DATABASE_URL not set")
+    return psycopg2.connect(DATABASE_URL)
 
-def _rows_to_dicts(cur):
-    cols = [c[0] for c in cur.description]
-    return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-def _exec(sql: str, params: dict | tuple | None = None, fetch: bool = False):
+def bootstrap_db():
     """
-    Esegue SQL con commit automatico. Se fetch=True ritorna list[dict]
+    Crea tabelle se non esistono (schema compatibile con il tuo DB attuale).
     """
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or {})
-            if fetch and cur.description:
-                return _rows_to_dicts(cur)
-            conn.commit()
-    return None
+    conn = get_conn()
+    cur = conn.cursor()
 
-# =========================
-# BOOTSTRAP SCHEMA
-# =========================
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS messages (
-  id SERIAL PRIMARY KEY,
-  content TEXT NOT NULL,
-  reply   TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
-);
+    # messages
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            content TEXT NOT NULL,
+            reply   TEXT,
+            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+        );
+    """)
 
-CREATE TABLE IF NOT EXISTS movements (
-  id SERIAL PRIMARY KEY,
-  message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
-  type VARCHAR(10) NOT NULL,             -- 'in' | 'out'
-  voce TEXT NOT NULL DEFAULT 'generale',
-  valuta VARCHAR(8) NOT NULL DEFAULT 'CHF',
-  note  TEXT,
-  created_at TIMESTAMP DEFAULT NOW(),
-  amount NUMERIC(14,2) NOT NULL,
-  currency VARCHAR(8) NOT NULL DEFAULT 'CHF',
-  category VARCHAR(50)
-);
+    # movements (schema allineato alla foto: id, message_id, type, voce, valuta, note, created_at, amount, currency, category)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS movements (
+            id SERIAL PRIMARY KEY,
+            message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+            type VARCHAR(10) NOT NULL,
+            voce TEXT NOT NULL DEFAULT 'generale',
+            valuta VARCHAR(8) NOT NULL DEFAULT 'CHF',
+            note  TEXT,
+            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+            amount NUMERIC(14,2) NOT NULL,
+            currency VARCHAR(8) NOT NULL DEFAULT 'CHF',
+            category VARCHAR(50)
+        );
+    """)
 
-CREATE INDEX IF NOT EXISTS idx_movements_created ON movements(created_at);
-"""
+    conn.commit()
+    cur.close()
+    conn.close()
 
-def bootstrap_schema():
-    for statement in SCHEMA_SQL.strip().split(";\n\n"):
-        s = (statement or "").strip()
-        if s:
-            _exec(s)
+# Esegui bootstrap all'avvio
+try:
+    bootstrap_db()
+except Exception as e:
+    # non bloccare l'avvio: lo segnaliamo su /healthz
+    print("DB bootstrap error:", e, flush=True)
 
-# =========================
-# SECURITY (API KEY + rate limit soft)
-# =========================
-WINDOW_SECONDS = 60
-MAX_REQ = 120  # per chiave/min
-_bucket: dict[str, tuple[int, int]] = {}
+# -----------------------------
+# Utils
+# -----------------------------
 
-@app.middleware("http")
-async def sec_and_rate(request: Request, call_next):
-    path = request.url.path
-    open_paths = {"/", "/healthz", "/webhook"}  # /webhook deve restare aperto per la verifica Meta
-    if path not in open_paths:
-        if not API_KEY_APP:
-            return JSONResponse({"error":"server_misconfigured_no_api_key"}, status_code=500)
-        if request.headers.get("x-api-key") != API_KEY_APP:
-            raise HTTPException(status_code=401, detail="invalid api key")
+def to_decimal(x):
+    if isinstance(x, (int, float, decimal.Decimal)):
+        return decimal.Decimal(str(x))
+    # stringhe tipo "123.45"
+    return decimal.Decimal(x)
 
-        # rate limit (chiave + ip)
-        ip = (request.headers.get("x-forwarded-for") or request.client.host or "-").split(",")[0].strip()
-        key = f"{ip}|{request.headers.get('x-api-key') or '-'}"
-        now = int(time.time())
-        w, c = _bucket.get(key, (now, 0))
-        if now - w >= WINDOW_SECONDS:
-            w, c = now, 0
-        c += 1
-        _bucket[key] = (w, c)
-        if c > MAX_REQ:
-            return JSONResponse({"error":"rate_limited","limit_per_min":MAX_REQ}, status_code=429)
+def ai_answer(prompt: str) -> str:
+    """
+    Chiama OpenAI; se non configurato, torna una risposta di fallback.
+    """
+    if _openai_client is None:
+        return "AI non configurata (manca OPENAI_API_KEY); risposta di fallback."
 
-    return await call_next(request)
+    try:
+        resp = _openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Sei un assistente aziendale pratico e conciso."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=180
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"[AI fallback] Errore modello: {e}"
 
-# =========================
-# ROUTES BASE
-# =========================
-@app.get("/")
+# -----------------------------
+# Endpoints base
+# -----------------------------
+
+@APP.get("/")
 def root():
     return {"status": "ok", "service": "flai-app"}
 
-@app.get("/healthz")
+@APP.get("/healthz")
 def healthz():
+    """
+    Verifica connessione DB (senza usare 'with cursor').
+    """
     try:
-        bootstrap_schema()
-        return "ok"
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        conn.close()
+        return {"status": "ok", "message": "FLAI API attiva 🚀"}
     except Exception as e:
-        return JSONResponse({"error":"db_bootstrap_failed","detail":str(e)}, status_code=500)
+        return {"error": "db_bootstrap_failed", "detail": str(e)}
 
-# =========================
-# /messages  (AI demo + persistenza)
-# =========================
-from openai import OpenAI
-_openai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# -----------------------------
+# Chat AI + persistenza
+# -----------------------------
 
-@app.post("/messages")
-def post_message(payload: dict = Body(...)):
+@APP.post("/messages")
+def create_message(payload: dict = Body(...)):
     """
-    Body: { "message": "..." }
+    Body: { "message": "testo" }
+    Salva domanda/risposta su 'messages'.
     """
-    bootstrap_schema()
-    msg = (payload or {}).get("message", "")
-    if not msg:
-        raise HTTPException(422, "message is required")
+    text = (payload or {}).get("message", "").strip()
+    if not text:
+        return JSONResponse({"error": "missing_message"}, status_code=400)
 
-    # Chiamata AI (se configurata), altrimenti eco
-    if _openai:
-        try:
-            res = _openai.chat.completions.create(
-                model=MODEL,
-                messages=[{"role":"user","content": msg}],
-                temperature=0.3,
-            )
-            reply = res.choices[0].message.content.strip()
-        except Exception as e:
-            reply = f"(AI temporarily unavailable) {e}"
-    else:
-        reply = f"Hai scritto: {msg}"
+    reply = ai_answer(text)
 
-    # Persistenza
-    _exec(
-        "INSERT INTO messages(content, reply, created_at) VALUES (%(c)s,%(r)s,NOW())",
-        {"c": msg, "r": reply},
-        fetch=False
-    )
-    row = _exec(
-        "SELECT id, content, reply, created_at FROM messages ORDER BY id DESC LIMIT 1",
-        fetch=True
-    )[0]
-    return row
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO messages (content, reply, created_at) VALUES (%s,%s,%s) RETURNING id",
+            (text, reply, datetime.utcnow())
+        )
+        mid = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return JSONResponse({"error": "db_insert_failed", "detail": str(e)}, status_code=500)
 
-@app.get("/messages/recent")
-def recent_messages(limit: int = 20):
-    bootstrap_schema()
-    rows = _exec(
-        "SELECT id, content, reply, created_at FROM messages ORDER BY created_at DESC LIMIT %(lim)s",
-        {"lim": limit},
-        fetch=True
-    )
-    return rows
+    return {"id": mid, "message": text, "reply": reply}
 
-# =========================
-# MOVEMENTS
-# =========================
-@app.post("/movements")
-def create_movement(item: dict = Body(...)):
+# -----------------------------
+# Movements (entrate/uscite)
+# -----------------------------
+
+@APP.post("/movements")
+def add_movement(payload: dict = Body(...)):
     """
-    Body: { "type":"in|out", "amount":123.45, "currency":"CHF", "category":"...", "note":"...", "voce":"...", "message_id":1 }
+    Body minimi:
+      {
+        "type": "in" | "out",
+        "amount": 123.45,
+        "currency": "CHF",       # opzionale (default DB = CHF)
+        "category": "sales",     # opzionale
+        "note": "incasso giorno" # opzionale
+      }
+    Colonne DB esistenti: (id, message_id, type, voce, valuta, note, created_at, amount, currency, category)
+    Settiamo automaticamente: voce='generale', valuta='CHF' (lasciamo i default).
     """
-    bootstrap_schema()
-    t = item.get("type")
+    t = (payload or {}).get("type", "").strip().lower()
     if t not in ("in", "out"):
-        raise HTTPException(422, "type must be 'in' or 'out'")
+        return JSONResponse({"error": "invalid_type", "detail": "type deve essere 'in' o 'out'."}, status_code=400)
 
-    amt = Decimal(str(item.get("amount", 0)))
-    if amt <= 0:
-        raise HTTPException(422, "amount must be > 0")
-
-    params = {
-        "mid": item.get("message_id"),
-        "t": t,
-        "v": item.get("voce", "generale"),
-        "val": item.get("valuta", "CHF"),
-        "n": item.get("note"),
-        "a": amt,
-        "c": item.get("currency", "CHF"),
-        "cat": item.get("category"),
-    }
-
-    _exec(
-        """
-        INSERT INTO movements(message_id,type,voce,valuta,note,created_at,amount,currency,category)
-        VALUES (%(mid)s,%(t)s,%(v)s,%(val)s,%(n)s,NOW(),%(a)s,%(c)s,%(cat)s)
-        """,
-        params
-    )
-    return {"status":"ok"}
-
-@app.get("/movements")
-def list_movements(_from: str | None = Query(None, alias="from"), to: str | None = None, limit: int = 200):
-    bootstrap_schema()
-    where = ["1=1"]
-    p = {"lim": limit}
-    if _from:
-        where.append("created_at >= %(f)s")
-        p["f"] = _from
-    if to:
-        where.append("created_at < %(t)s")
-        p["t"] = to
-    sql = f"""
-        SELECT id, message_id, type, voce, valuta, note, created_at, amount, currency, category
-        FROM movements
-        WHERE {' AND '.join(where)}
-        ORDER BY created_at DESC
-        LIMIT %(lim)s
-    """
-    rows = _exec(sql, p, fetch=True)
-    # Totali
-    totals = _exec(
-        f"""
-        SELECT
-          COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)  AS total_in,
-          COALESCE(SUM(CASE WHEN type='out' THEN amount END),0)  AS total_out
-        FROM movements
-        WHERE {' AND '.join(where)}
-        """,
-        p,
-        fetch=True
-    )[0]
-    totals["net"] = Decimal(totals["total_in"]) - Decimal(totals["total_out"])
-    return {"items": rows, "totals": totals}
-
-# =========================
-# ANALYTICS
-# =========================
-@app.get("/analytics/overview")
-def analytics_overview(days: int = 30):
-    """
-    Ritorna kpi base per ultimi N giorni
-    """
-    bootstrap_schema()
-    days = max(1, min(days, 90))
-    # Serie giorni
-    start = (datetime.utcnow().date() - timedelta(days=days-1)).isoformat()
-
-    # messaggi
-    msgs = _exec(
-        """
-        SELECT DATE(created_at) AS d, COUNT(*) AS n
-        FROM messages
-        WHERE created_at >= %(start)s
-        GROUP BY DATE(created_at)
-        ORDER BY DATE(created_at)
-        """,
-        {"start": start},
-        fetch=True
-    )
-
-    # movimenti
-    mov = _exec(
-        """
-        SELECT DATE(created_at) AS d,
-               COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS in_amt,
-               COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS out_amt
-        FROM movements
-        WHERE created_at >= %(start)s
-        GROUP BY DATE(created_at)
-        ORDER BY DATE(created_at)
-        """,
-        {"start": start},
-        fetch=True
-    )
-
-    return {"messages_by_day": msgs, "movements_by_day": mov}
-
-# =========================
-# SUMMARIES (testo naturale)
-# =========================
-@app.post("/summaries/generate")
-def generate_summary(days: int = 30):
-    bootstrap_schema()
-    days = max(1, min(days, 90))
-    # recupera totali
-    totals = _exec(
-        """
-        SELECT
-          COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
-          COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
-        FROM movements
-        WHERE created_at >= NOW() - %(days)s::interval
-        """,
-        {"days": f"{days} days"},
-        fetch=True
-    )[0]
-    totals["net"] = Decimal(totals["total_in"]) - Decimal(totals["total_out"])
-
-    # genera testo con AI se disponibile
-    if _openai:
-        prompt = f"""Sei un assistente che riassume KPI aziendali in modo chiaro.
-Ultimi {days} giorni:
-- Entrate (in): {totals['total_in']}
-- Uscite (out): {totals['total_out']}
-- Netto: {totals['net']}
-Scrivi 2 frasi di insight in italiano, tono professionale ma semplice."""
-        try:
-            res = _openai.chat.completions.create(
-                model=MODEL,
-                messages=[{"role":"user","content": prompt}],
-                temperature=0.2,
-            )
-            text = res.choices[0].message.content.strip()
-        except Exception as e:
-            text = f"Riassunto semplice: netto {totals['net']} (in {totals['total_in']} / out {totals['total_out']}). [AI error: {e}]"
-    else:
-        text = f"Netto {totals['net']} negli ultimi {days} giorni (Entrate {totals['total_in']} / Uscite {totals['total_out']})."
-
-    return {"totals": totals, "summary": text}
-
-# =========================
-# WEBHOOK META (verify + eventi)
-# =========================
-@app.get("/webhook")
-def whatsapp_verify(hub_mode: str = "", hub_challenge: str = "", hub_verify_token: str = ""):
-    if hub_mode == "subscribe" and hub_verify_token == META_VERIFY_TOKEN:
-        return PlainTextResponse(hub_challenge or "", media_type="text/plain")
-    raise HTTPException(403, "verification_failed")
-
-@app.post("/webhook")
-async def whatsapp_events(payload: dict = Body(...)):
-    """
-    Accetta sia test interni {message:"..."} sia notifiche Meta (semplificato)
-    """
-    if "message" in payload:
-        # riusa /messages
-        return post_message({"message": payload["message"]})
-
-    # parse minimale formato Meta
     try:
-        entry = payload.get("entry", [])[0]
-        change = entry.get("changes", [])[0]
-        value  = change.get("value", {})
-        messages = value.get("messages", [])
-        if not messages:
-            return {"status":"ok"}
-        text = messages[0].get("text", {}).get("body") or "[no text]"
-        return post_message({"message": text})
+        amt = to_decimal((payload or {}).get("amount"))
+    except Exception:
+        return JSONResponse({"error": "invalid_amount"}, status_code=400)
+
+    cur_code = (payload or {}).get("currency") or None
+    cat = (payload or {}).get("category") or None
+    note = (payload or {}).get("note") or None
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO movements (type, amount, currency, category, note)
+            VALUES (%s, %s, COALESCE(%s,'CHF'), %s, %s)
+            RETURNING id, created_at
+            """,
+            (t, amt, cur_code, cat, note)
+        )
+        rid = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "ok", "id": rid[0], "created_at": rid[1].isoformat()}
     except Exception as e:
-        if DEBUG:
-            return {"status":"ok","note":f"unparsed payload: {str(e)}"}
-        return {"status":"ok"}
+        return JSONResponse({"error": "db_failed_insert", "detail": str(e)}, status_code=500)
+
+@APP.get("/movements")
+def list_movements(limit: int = 200):
+    """
+    Lista ultimi movimenti + totali in/out/netto.
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute(
+            """
+            SELECT id, type, amount, currency, category, note, created_at
+            FROM movements
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (limit,)
+        )
+        rows = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
+              COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
+            FROM movements
+            """
+        )
+        totals = cur.fetchone()
+
+        cur.close()
+        conn.close()
+
+        # serializza Decimal -> float
+        for r in rows:
+            if isinstance(r.get("amount"), decimal.Decimal):
+                r["amount"] = float(r["amount"])
+        if isinstance(totals.get("total_in"), decimal.Decimal):
+            totals["total_in"] = float(totals["total_in"])
+        if isinstance(totals.get("total_out"), decimal.Decimal):
+            totals["total_out"] = float(totals["total_out"])
+        totals["net"] = totals["total_in"] - totals["total_out"]
+
+        return {"items": rows, "totals": totals}
+
+    except Exception as e:
+        return JSONResponse({"error": "db_failed_query", "detail": str(e)}, status_code=500)
