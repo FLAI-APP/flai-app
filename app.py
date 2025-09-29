@@ -4,7 +4,8 @@ import json
 import decimal
 from typing import Optional, Dict, Any
 
-import psycopg
+import psycopg2
+import psycopg2.extras
 from psycopg.rows import dict_row
 from fastapi import FastAPI, Request, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,7 +64,7 @@ def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not configured")
     # row_factory=dict_row => ritorna dict
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def _d(v):
     return float(v) if isinstance(v, decimal.Decimal) else v
