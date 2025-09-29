@@ -1,334 +1,397 @@
 import os
-import time
 import json
-import decimal
-from typing import Optional, Dict, Any
+import time
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
-import psycopg2
-import psycopg2.extras
-from psycopg.rows import dict_row
 from fastapi import FastAPI, Request, HTTPException, Body, Query
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
-# ----------------- CONFIG -----------------
+import pg8000.dbapi as pg
+from decimal import Decimal
+
+# =========================
+# CONFIG / ENV
+# =========================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+DATABASE_URL   = os.getenv("DATABASE_URL", "")
+API_KEY_APP    = os.getenv("API_KEY_APP", "")
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "flai-verify-123")
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
+# =========================
+# FASTAPI
+# =========================
 app = FastAPI(title="flai-app")
 
-API_KEY_APP   = os.getenv("API_KEY_APP", "").strip()
-DATABASE_URL  = os.getenv("DATABASE_URL", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-# CORS (domini separati da virgola)
-origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins or [],
+    allow_origins=ALLOWED_ORIGINS or [],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------- SECURITY + RATE LIMIT -----------------
-WINDOW_SECONDS = 60
-MAX_REQ = 120
-_bucket: Dict[str, Any] = {}
+# =========================
+# DB helper (pg8000)
+# =========================
+def _pg_params_from_url(db_url: str) -> dict:
+    """
+    Converte postgresql://user:pass@host:port/dbname in kwargs per pg8000.dbapi.connect
+    """
+    u = urlparse(db_url)
+    if u.scheme not in ("postgresql", "postgres"):
+        raise RuntimeError("DATABASE_URL must start with postgresql://")
+    return {
+        "user":     u.username,
+        "password": u.password,
+        "host":     u.hostname,
+        "port":     u.port or 5432,
+        "database": u.path.lstrip("/"),
+        "ssl_context": True,  # Render usa SSL
+    }
 
-def _client_key(req: Request) -> str:
-    xf = req.headers.get("x-forwarded-for")
-    ip = xf.split(",")[0].strip() if xf else (req.client.host if req.client else "unknown")
-    return ip + "|" + (req.headers.get("x-api-key") or "-")
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not configured")
+    return pg.connect(**_pg_params_from_url(DATABASE_URL))
+
+def _rows_to_dicts(cur):
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+def _exec(sql: str, params: dict | tuple | None = None, fetch: bool = False):
+    """
+    Esegue SQL con commit automatico. Se fetch=True ritorna list[dict]
+    """
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or {})
+            if fetch and cur.description:
+                return _rows_to_dicts(cur)
+            conn.commit()
+    return None
+
+# =========================
+# BOOTSTRAP SCHEMA
+# =========================
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS messages (
+  id SERIAL PRIMARY KEY,
+  content TEXT NOT NULL,
+  reply   TEXT,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS movements (
+  id SERIAL PRIMARY KEY,
+  message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+  type VARCHAR(10) NOT NULL,             -- 'in' | 'out'
+  voce TEXT NOT NULL DEFAULT 'generale',
+  valuta VARCHAR(8) NOT NULL DEFAULT 'CHF',
+  note  TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  amount NUMERIC(14,2) NOT NULL,
+  currency VARCHAR(8) NOT NULL DEFAULT 'CHF',
+  category VARCHAR(50)
+);
+
+CREATE INDEX IF NOT EXISTS idx_movements_created ON movements(created_at);
+"""
+
+def bootstrap_schema():
+    for statement in SCHEMA_SQL.strip().split(";\n\n"):
+        s = (statement or "").strip()
+        if s:
+            _exec(s)
+
+# =========================
+# SECURITY (API KEY + rate limit soft)
+# =========================
+WINDOW_SECONDS = 60
+MAX_REQ = 120  # per chiave/min
+_bucket: dict[str, tuple[int, int]] = {}
 
 @app.middleware("http")
-async def auth_and_rate_limit(request: Request, call_next):
+async def sec_and_rate(request: Request, call_next):
     path = request.url.path
-    if path not in {"/", "/healthz"}:
+    open_paths = {"/", "/healthz", "/webhook"}  # /webhook deve restare aperto per la verifica Meta
+    if path not in open_paths:
         if not API_KEY_APP:
-            return JSONResponse({"error":"server_no_api_key"}, status_code=500)
+            return JSONResponse({"error":"server_misconfigured_no_api_key"}, status_code=500)
         if request.headers.get("x-api-key") != API_KEY_APP:
             raise HTTPException(status_code=401, detail="invalid api key")
 
+        # rate limit (chiave + ip)
+        ip = (request.headers.get("x-forwarded-for") or request.client.host or "-").split(",")[0].strip()
+        key = f"{ip}|{request.headers.get('x-api-key') or '-'}"
         now = int(time.time())
-        key = _client_key(request)
-        wstart, cnt = _bucket.get(key, (now, 0))
-        if now - wstart >= WINDOW_SECONDS:
-            wstart, cnt = now, 0
-        cnt += 1
-        _bucket[key] = (wstart, cnt)
-        if cnt > MAX_REQ:
+        w, c = _bucket.get(key, (now, 0))
+        if now - w >= WINDOW_SECONDS:
+            w, c = now, 0
+        c += 1
+        _bucket[key] = (w, c)
+        if c > MAX_REQ:
             return JSONResponse({"error":"rate_limited","limit_per_min":MAX_REQ}, status_code=429)
 
     return await call_next(request)
 
-# ----------------- DB HELPERS (psycopg v3) -----------------
-def db_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not configured")
-    # row_factory=dict_row => ritorna dict
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-
-def _d(v):
-    return float(v) if isinstance(v, decimal.Decimal) else v
-
-# ----------------- ROOT/HEALTH -----------------
+# =========================
+# ROUTES BASE
+# =========================
 @app.get("/")
 def root():
-    return {"status":"ok","service":"flai-app"}
+    return {"status": "ok", "service": "flai-app"}
 
 @app.get("/healthz")
 def healthz():
     try:
-        with db_conn() as con, con.cursor() as cur:
-            cur.execute("SELECT 1 AS ok;")
-            row = cur.fetchone()
-        return {"ok": True, "db": row["ok"] == 1}
+        bootstrap_schema()
+        return "ok"
     except Exception as e:
-        return {"ok": False, "db_error": str(e)}
+        return JSONResponse({"error":"db_bootstrap_failed","detail":str(e)}, status_code=500)
 
-# ----------------- MESSAGES -----------------
-@app.get("/messages")
-def list_messages(limit: int = 20):
-    sql = """
-        SELECT id, content, reply, created_at
-        FROM messages
-        ORDER BY created_at DESC
-        LIMIT %s
+# =========================
+# /messages  (AI demo + persistenza)
+# =========================
+from openai import OpenAI
+_openai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+@app.post("/messages")
+def post_message(payload: dict = Body(...)):
     """
-    try:
-        with db_conn() as con, con.cursor() as cur:
-            cur.execute(sql, (limit,))
-            rows = cur.fetchall()
-        rows = [{k:_d(v) for k,v in r.items()} for r in rows]
-        return {"items": rows}
-    except Exception as e:
-        return JSONResponse({"error":"db_failed_query","detail":str(e)}, status_code=500)
-
-# ----------------- WEBHOOK (AI demo) -----------------
-@app.post("/webhook")
-def webhook(payload: Dict[str, Any] = Body(...)):
-    msg = (payload or {}).get("message", "").strip()
+    Body: { "message": "..." }
+    """
+    bootstrap_schema()
+    msg = (payload or {}).get("message", "")
     if not msg:
-        raise HTTPException(422, "missing message")
+        raise HTTPException(422, "message is required")
 
-    # genera reply (OpenAI se disponibile, altrimenti eco)
-    reply_text = f"Hai scritto: {msg}"
-    if OPENAI_API_KEY:
+    # Chiamata AI (se configurata), altrimenti eco
+    if _openai:
         try:
-            from openai import OpenAI
-            oai = OpenAI(api_key=OPENAI_API_KEY)
-            resp = oai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role":"system","content":"Rispondi in modo utile e sintetico."},
-                    {"role":"user","content": msg}
-                ],
+            res = _openai.chat.completions.create(
+                model=MODEL,
+                messages=[{"role":"user","content": msg}],
                 temperature=0.3,
-                max_tokens=200
             )
-            reply_text = resp.choices[0].message.content.strip()
-        except Exception:
-            pass
+            reply = res.choices[0].message.content.strip()
+        except Exception as e:
+            reply = f"(AI temporarily unavailable) {e}"
+    else:
+        reply = f"Hai scritto: {msg}"
 
-    ins = """
-        INSERT INTO messages (content, reply, created_at)
-        VALUES (%s, %s, NOW())
-        RETURNING id
-    """
-    try:
-        with db_conn() as con, con.cursor() as cur:
-            cur.execute(ins, (msg, reply_text))
-            saved_id = cur.fetchone()["id"]
-            con.commit()
-        return {"id": saved_id, "reply": reply_text}
-    except Exception as e:
-        return JSONResponse({"error":"db_failed_insert","detail":str(e)}, status_code=500)
+    # Persistenza
+    _exec(
+        "INSERT INTO messages(content, reply, created_at) VALUES (%(c)s,%(r)s,NOW())",
+        {"c": msg, "r": reply},
+        fetch=False
+    )
+    row = _exec(
+        "SELECT id, content, reply, created_at FROM messages ORDER BY id DESC LIMIT 1",
+        fetch=True
+    )[0]
+    return row
 
-# ----------------- MOVEMENTS (schema della tua tabella) -----------------
+@app.get("/messages/recent")
+def recent_messages(limit: int = 20):
+    bootstrap_schema()
+    rows = _exec(
+        "SELECT id, content, reply, created_at FROM messages ORDER BY created_at DESC LIMIT %(lim)s",
+        {"lim": limit},
+        fetch=True
+    )
+    return rows
+
+# =========================
+# MOVEMENTS
+# =========================
 @app.post("/movements")
-def create_movement(item: Dict[str, Any] = Body(...)):
-    t = (item.get("type") or "").strip()
-    if t not in ("in","out"):
+def create_movement(item: dict = Body(...)):
+    """
+    Body: { "type":"in|out", "amount":123.45, "currency":"CHF", "category":"...", "note":"...", "voce":"...", "message_id":1 }
+    """
+    bootstrap_schema()
+    t = item.get("type")
+    if t not in ("in", "out"):
         raise HTTPException(422, "type must be 'in' or 'out'")
 
-    try:
-        amount = decimal.Decimal(str(item.get("amount")))
-    except Exception:
-        raise HTTPException(422, "amount must be a number")
+    amt = Decimal(str(item.get("amount", 0)))
+    if amt <= 0:
+        raise HTTPException(422, "amount must be > 0")
 
-    message_id = item.get("message_id")
-    voce   = (item.get("voce") or "generale").strip()
-    valuta = (item.get("valuta") or "CHF").strip()      # colonna 'valuta'
-    note   = (item.get("note") or "").strip()
-    currency = (item.get("currency") or "CHF").strip()  # colonna 'currency'
-    category = (item.get("category") or "").strip()
-
-    sql = """
-        INSERT INTO movements (message_id, type, voce, valuta, note, created_at, amount, currency, category)
-        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s)
-        RETURNING id
-    """
-    try:
-        with db_conn() as con, con.cursor() as cur:
-            cur.execute(sql, (message_id, t, voce, valuta, note, amount, currency, category))
-            rid = cur.fetchone()["id"]
-            con.commit()
-        return {"status":"ok","id":rid}
-    except Exception as e:
-        return JSONResponse({"error":"db_failed_insert","detail":str(e)}, status_code=500)
-
-@app.get("/movements")
-def list_movements(
-    _from: Optional[str] = Query(None, alias="from"),
-    to: Optional[str] = None,
-    limit: int = 200
-):
-    base = """
-        SELECT id, message_id, type, voce, valuta, note, created_at, amount, currency, category
-        FROM movements
-        WHERE 1=1
-    """
-    params = []
-    if _from:
-        base += " AND created_at >= %s"; params.append(_from)
-    if to:
-        base += " AND created_at < %s"; params.append(to)
-    base += " ORDER BY created_at DESC LIMIT %s"; params.append(limit)
-
-    try:
-        with db_conn() as con, con.cursor() as cur:
-            cur.execute(base, tuple(params))
-            items = cur.fetchall()
-
-            qsum = """
-                SELECT
-                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
-                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
-                FROM movements
-                WHERE 1=1
-            """
-            p2 = []
-            if _from:
-                qsum += " AND created_at >= %s"; p2.append(_from)
-            if to:
-                qsum += " AND created_at < %s"; p2.append(to)
-            cur.execute(qsum, tuple(p2))
-            totals = cur.fetchone()
-
-        items  = [{k:_d(v) for k,v in r.items()} for r in items]
-        totals = {k:_d(v) for k,v in totals.items()}
-        totals["net"] = _d(decimal.Decimal(str(totals["total_in"])) - decimal.Decimal(str(totals["total_out"])))
-        return {"items": items, "totals": totals}
-    except Exception as e:
-        return JSONResponse({"error":"db_failed_query","detail":str(e)}, status_code=500)
-
-# ----------------- ANALYTICS -----------------
-@app.get("/analytics/overview")
-def analytics_overview(days: int = 30):
-    if days < 1 or days > 365:
-        raise HTTPException(422, "days must be between 1 and 365")
-    try:
-        with db_conn() as con, con.cursor() as cur:
-            cur.execute(
-                """
-                WITH days AS (
-                  SELECT generate_series(
-                    (CURRENT_DATE - (%s - 1) * INTERVAL '1 day')::date,
-                    CURRENT_DATE::date,
-                    INTERVAL '1 day'
-                  )::date AS d
-                ),
-                agg AS (
-                  SELECT DATE(created_at) AS d,
-                    COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS in_amt,
-                    COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS out_amt
-                  FROM movements
-                  WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
-                  GROUP BY DATE(created_at)
-                )
-                SELECT
-                  days.d AS date,
-                  COALESCE(agg.in_amt,0)  AS in,
-                  COALESCE(agg.out_amt,0) AS out,
-                  COALESCE(agg.in_amt,0) - COALESCE(agg.out_amt,0) AS net
-                FROM days
-                LEFT JOIN agg ON agg.d = days.d
-                ORDER BY days.d ASC
-                """,
-                (days, days)
-            )
-            rows = cur.fetchall()
-
-            cur.execute(
-                """
-                SELECT
-                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
-                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
-                FROM movements
-                WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
-                """,
-                (days,)
-            )
-            totals = cur.fetchone()
-
-        rows = [{k:_d(v) for k,v in r.items()} for r in rows]
-        totals = {k:_d(v) for k,v in totals.items()}
-        totals["net"] = _d(decimal.Decimal(str(totals["total_in"])) - decimal.Decimal(str(totals["total_out"])))
-        return {"days": rows, "totals": totals}
-    except Exception as e:
-        return JSONResponse({"error":"db_failed_analytics","detail":str(e)}, status_code=500)
-
-# ----------------- SUMMARIES -----------------
-@app.post("/summaries/generate")
-def generate_summary(days: int = 30):
-    try:
-        with db_conn() as con, con.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) AS messages_count FROM messages WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'",
-                (days,)
-            )
-            m = cur.fetchone()
-            cur.execute(
-                """
-                SELECT
-                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
-                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
-                FROM movements
-                WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
-                """,
-                (days,)
-            )
-            mv = cur.fetchone()
-    except Exception as e:
-        return JSONResponse({"error":"db_failed_kpi","detail":str(e)}, status_code=500)
-
-    total_in = _d(mv["total_in"])
-    total_out = _d(mv["total_out"])
-    net = _d(decimal.Decimal(str(total_in)) - decimal.Decimal(str(total_out)))
-    kpi = {
-        "window_days": days,
-        "messages": int(m["messages_count"]),
-        "revenue_in": total_in,
-        "expenses_out": total_out,
-        "net": net
+    params = {
+        "mid": item.get("message_id"),
+        "t": t,
+        "v": item.get("voce", "generale"),
+        "val": item.get("valuta", "CHF"),
+        "n": item.get("note"),
+        "a": amt,
+        "c": item.get("currency", "CHF"),
+        "cat": item.get("category"),
     }
 
-    summary_text = (
-        f"Ultimi {days} giorni: messaggi {kpi['messages']}, "
-        f"entrate {kpi['revenue_in']}, uscite {kpi['expenses_out']}, "
-        f"netto {kpi['net']}."
+    _exec(
+        """
+        INSERT INTO movements(message_id,type,voce,valuta,note,created_at,amount,currency,category)
+        VALUES (%(mid)s,%(t)s,%(v)s,%(val)s,%(n)s,NOW(),%(a)s,%(c)s,%(cat)s)
+        """,
+        params
     )
-    if OPENAI_API_KEY:
-        try:
-            from openai import OpenAI
-            oai = OpenAI(api_key=OPENAI_API_KEY)
-            prompt = "Scrivi un breve riepilogo manageriale (5-8 frasi) dei KPI:\n" + json.dumps(kpi, ensure_ascii=False)
-            resp = oai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role":"user","content": prompt}],
-                temperature=0.4,
-                max_tokens=300
-            )
-            summary_text = resp.choices[0].message.content.strip()
-        except Exception:
-            pass
+    return {"status":"ok"}
 
-    return {"kpi": kpi, "summary": summary_text}
+@app.get("/movements")
+def list_movements(_from: str | None = Query(None, alias="from"), to: str | None = None, limit: int = 200):
+    bootstrap_schema()
+    where = ["1=1"]
+    p = {"lim": limit}
+    if _from:
+        where.append("created_at >= %(f)s")
+        p["f"] = _from
+    if to:
+        where.append("created_at < %(t)s")
+        p["t"] = to
+    sql = f"""
+        SELECT id, message_id, type, voce, valuta, note, created_at, amount, currency, category
+        FROM movements
+        WHERE {' AND '.join(where)}
+        ORDER BY created_at DESC
+        LIMIT %(lim)s
+    """
+    rows = _exec(sql, p, fetch=True)
+    # Totali
+    totals = _exec(
+        f"""
+        SELECT
+          COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)  AS total_in,
+          COALESCE(SUM(CASE WHEN type='out' THEN amount END),0)  AS total_out
+        FROM movements
+        WHERE {' AND '.join(where)}
+        """,
+        p,
+        fetch=True
+    )[0]
+    totals["net"] = Decimal(totals["total_in"]) - Decimal(totals["total_out"])
+    return {"items": rows, "totals": totals}
+
+# =========================
+# ANALYTICS
+# =========================
+@app.get("/analytics/overview")
+def analytics_overview(days: int = 30):
+    """
+    Ritorna kpi base per ultimi N giorni
+    """
+    bootstrap_schema()
+    days = max(1, min(days, 90))
+    # Serie giorni
+    start = (datetime.utcnow().date() - timedelta(days=days-1)).isoformat()
+
+    # messaggi
+    msgs = _exec(
+        """
+        SELECT DATE(created_at) AS d, COUNT(*) AS n
+        FROM messages
+        WHERE created_at >= %(start)s
+        GROUP BY DATE(created_at)
+        ORDER BY DATE(created_at)
+        """,
+        {"start": start},
+        fetch=True
+    )
+
+    # movimenti
+    mov = _exec(
+        """
+        SELECT DATE(created_at) AS d,
+               COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS in_amt,
+               COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS out_amt
+        FROM movements
+        WHERE created_at >= %(start)s
+        GROUP BY DATE(created_at)
+        ORDER BY DATE(created_at)
+        """,
+        {"start": start},
+        fetch=True
+    )
+
+    return {"messages_by_day": msgs, "movements_by_day": mov}
+
+# =========================
+# SUMMARIES (testo naturale)
+# =========================
+@app.post("/summaries/generate")
+def generate_summary(days: int = 30):
+    bootstrap_schema()
+    days = max(1, min(days, 90))
+    # recupera totali
+    totals = _exec(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
+          COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
+        FROM movements
+        WHERE created_at >= NOW() - %(days)s::interval
+        """,
+        {"days": f"{days} days"},
+        fetch=True
+    )[0]
+    totals["net"] = Decimal(totals["total_in"]) - Decimal(totals["total_out"])
+
+    # genera testo con AI se disponibile
+    if _openai:
+        prompt = f"""Sei un assistente che riassume KPI aziendali in modo chiaro.
+Ultimi {days} giorni:
+- Entrate (in): {totals['total_in']}
+- Uscite (out): {totals['total_out']}
+- Netto: {totals['net']}
+Scrivi 2 frasi di insight in italiano, tono professionale ma semplice."""
+        try:
+            res = _openai.chat.completions.create(
+                model=MODEL,
+                messages=[{"role":"user","content": prompt}],
+                temperature=0.2,
+            )
+            text = res.choices[0].message.content.strip()
+        except Exception as e:
+            text = f"Riassunto semplice: netto {totals['net']} (in {totals['total_in']} / out {totals['total_out']}). [AI error: {e}]"
+    else:
+        text = f"Netto {totals['net']} negli ultimi {days} giorni (Entrate {totals['total_in']} / Uscite {totals['total_out']})."
+
+    return {"totals": totals, "summary": text}
+
+# =========================
+# WEBHOOK META (verify + eventi)
+# =========================
+@app.get("/webhook")
+def whatsapp_verify(hub_mode: str = "", hub_challenge: str = "", hub_verify_token: str = ""):
+    if hub_mode == "subscribe" and hub_verify_token == META_VERIFY_TOKEN:
+        return PlainTextResponse(hub_challenge or "", media_type="text/plain")
+    raise HTTPException(403, "verification_failed")
+
+@app.post("/webhook")
+async def whatsapp_events(payload: dict = Body(...)):
+    """
+    Accetta sia test interni {message:"..."} sia notifiche Meta (semplificato)
+    """
+    if "message" in payload:
+        # riusa /messages
+        return post_message({"message": payload["message"]})
+
+    # parse minimale formato Meta
+    try:
+        entry = payload.get("entry", [])[0]
+        change = entry.get("changes", [])[0]
+        value  = change.get("value", {})
+        messages = value.get("messages", [])
+        if not messages:
+            return {"status":"ok"}
+        text = messages[0].get("text", {}).get("body") or "[no text]"
+        return post_message({"message": text})
+    except Exception as e:
+        if DEBUG:
+            return {"status":"ok","note":f"unparsed payload: {str(e)}"}
+        return {"status":"ok"}
