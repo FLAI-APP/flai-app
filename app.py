@@ -2,24 +2,23 @@ import os
 import time
 import json
 import decimal
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 from fastapi import FastAPI, Request, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 
-# ============ CONFIG ============
+# ----------------- CONFIG -----------------
 app = FastAPI(title="flai-app")
 
-API_KEY_APP = os.getenv("API_KEY_APP", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+API_KEY_APP   = os.getenv("API_KEY_APP", "").strip()
+DATABASE_URL  = os.getenv("DATABASE_URL", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-# CORS (solo se passi domini in env, separati da virgola)
-origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+# CORS (domini separati da virgola)
+origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins or [],
@@ -28,7 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============ SECURITY & RATE LIMIT ============
+# ----------------- SECURITY + RATE LIMIT -----------------
 WINDOW_SECONDS = 60
 MAX_REQ = 120
 _bucket: Dict[str, Any] = {}
@@ -41,7 +40,6 @@ def _client_key(req: Request) -> str:
 @app.middleware("http")
 async def auth_and_rate_limit(request: Request, call_next):
     path = request.url.path
-
     if path not in {"/", "/healthz"}:
         if not API_KEY_APP:
             return JSONResponse({"error":"server_no_api_key"}, status_code=500)
@@ -60,26 +58,23 @@ async def auth_and_rate_limit(request: Request, call_next):
 
     return await call_next(request)
 
-# ============ DB HELPERS ============
+# ----------------- DB HELPERS (psycopg v3) -----------------
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not configured")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    # row_factory=dict_row => ritorna dict
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
-def _d(value):
-    """Converte Decimal in float per JSON pulito."""
-    if isinstance(value, decimal.Decimal):
-        return float(value)
-    return value
+def _d(v):
+    return float(v) if isinstance(v, decimal.Decimal) else v
 
-# ============ ROOT & HEALTH ============
+# ----------------- ROOT/HEALTH -----------------
 @app.get("/")
 def root():
     return {"status":"ok","service":"flai-app"}
 
 @app.get("/healthz")
 def healthz():
-    # ping leggero al DB
     try:
         with db_conn() as con, con.cursor() as cur:
             cur.execute("SELECT 1 AS ok;")
@@ -88,13 +83,10 @@ def healthz():
     except Exception as e:
         return {"ok": False, "db_error": str(e)}
 
-# ============ MESSAGES ============
+# ----------------- MESSAGES -----------------
 @app.get("/messages")
 def list_messages(limit: int = 20):
-    """
-    Ritorna gli ultimi N messaggi salvati (tabella 'messages' con colonne: id, content, reply, created_at).
-    """
-    q = """
+    sql = """
         SELECT id, content, reply, created_at
         FROM messages
         ORDER BY created_at DESC
@@ -102,30 +94,24 @@ def list_messages(limit: int = 20):
     """
     try:
         with db_conn() as con, con.cursor() as cur:
-            cur.execute(q, (limit,))
+            cur.execute(sql, (limit,))
             rows = cur.fetchall()
-        # normalizza Decimals
-        rows = [{k: _d(v) for k,v in r.items()} for r in rows]
+        rows = [{k:_d(v) for k,v in r.items()} for r in rows]
         return {"items": rows}
     except Exception as e:
         return JSONResponse({"error":"db_failed_query","detail":str(e)}, status_code=500)
 
-# ============ WEBHOOK (demo conversazione AI) ============
+# ----------------- WEBHOOK (AI demo) -----------------
 @app.post("/webhook")
 def webhook(payload: Dict[str, Any] = Body(...)):
-    """
-    Demo: prende {"message":"..."} -> genera reply (OpenAI se chiave presente, altrimenti eco)
-    e salva su 'messages'.
-    """
     msg = (payload or {}).get("message", "").strip()
     if not msg:
         raise HTTPException(422, "missing message")
 
-    # 1) genera risposta
-    reply_text = ""
+    # genera reply (OpenAI se disponibile, altrimenti eco)
+    reply_text = f"Hai scritto: {msg}"
     if OPENAI_API_KEY:
         try:
-            # OpenAI (client 1.x)
             from openai import OpenAI
             oai = OpenAI(api_key=OPENAI_API_KEY)
             resp = oai.chat.completions.create(
@@ -138,12 +124,9 @@ def webhook(payload: Dict[str, Any] = Body(...)):
                 max_tokens=200
             )
             reply_text = resp.choices[0].message.content.strip()
-        except Exception as e:
-            reply_text = f"(fallback) Hai scritto: {msg}"
-    else:
-        reply_text = f"Hai scritto: {msg}"
+        except Exception:
+            pass
 
-    # 2) salva nel DB
     ins = """
         INSERT INTO messages (content, reply, created_at)
         VALUES (%s, %s, NOW())
@@ -152,48 +135,39 @@ def webhook(payload: Dict[str, Any] = Body(...)):
     try:
         with db_conn() as con, con.cursor() as cur:
             cur.execute(ins, (msg, reply_text))
-            row = cur.fetchone()
+            saved_id = cur.fetchone()["id"]
             con.commit()
-            saved_id = row["id"]
+        return {"id": saved_id, "reply": reply_text}
     except Exception as e:
         return JSONResponse({"error":"db_failed_insert","detail":str(e)}, status_code=500)
 
-    return {"id": saved_id, "reply": reply_text}
-
-# ============ MOVEMENTS ============
+# ----------------- MOVEMENTS (schema della tua tabella) -----------------
 @app.post("/movements")
 def create_movement(item: Dict[str, Any] = Body(...)):
-    """
-    Inserisce un movimento nel *tuo* schema attuale (foto):
-    columns: id, message_id, type, voce, valuta, note, created_at, amount, currency, category
-    - 'voce' default 'generale'
-    - 'currency' default 'CHF'
-    """
     t = (item.get("type") or "").strip()
-    if t not in ("in", "out"):
+    if t not in ("in","out"):
         raise HTTPException(422, "type must be 'in' or 'out'")
 
-    amount = item.get("amount")
     try:
-        amount = decimal.Decimal(str(amount))
+        amount = decimal.Decimal(str(item.get("amount")))
     except Exception:
         raise HTTPException(422, "amount must be a number")
 
-    message_id = item.get("message_id")  # opzionale
-    voce = (item.get("voce") or "generale").strip()
-    valuta = (item.get("valuta") or "CHF").strip()      # la tua colonna 'valuta'
-    note = (item.get("note") or "").strip()
+    message_id = item.get("message_id")
+    voce   = (item.get("voce") or "generale").strip()
+    valuta = (item.get("valuta") or "CHF").strip()      # colonna 'valuta'
+    note   = (item.get("note") or "").strip()
     currency = (item.get("currency") or "CHF").strip()  # colonna 'currency'
     category = (item.get("category") or "").strip()
 
-    q = """
+    sql = """
         INSERT INTO movements (message_id, type, voce, valuta, note, created_at, amount, currency, category)
         VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s)
         RETURNING id
     """
     try:
         with db_conn() as con, con.cursor() as cur:
-            cur.execute(q, (message_id, t, voce, valuta, note, amount, currency, category))
+            cur.execute(sql, (message_id, t, voce, valuta, note, amount, currency, category))
             rid = cur.fetchone()["id"]
             con.commit()
         return {"status":"ok","id":rid}
@@ -206,9 +180,6 @@ def list_movements(
     to: Optional[str] = None,
     limit: int = 200
 ):
-    """
-    Elenco movimenti + totali entrate/uscite, rispettando lo schema attuale.
-    """
     base = """
         SELECT id, message_id, type, voce, valuta, note, created_at, amount, currency, category
         FROM movements
@@ -216,20 +187,16 @@ def list_movements(
     """
     params = []
     if _from:
-        base += " AND created_at >= %s"
-        params.append(_from)
+        base += " AND created_at >= %s"; params.append(_from)
     if to:
-        base += " AND created_at < %s"
-        params.append(to)
-    base += " ORDER BY created_at DESC LIMIT %s"
-    params.append(limit)
+        base += " AND created_at < %s"; params.append(to)
+    base += " ORDER BY created_at DESC LIMIT %s"; params.append(limit)
 
     try:
         with db_conn() as con, con.cursor() as cur:
             cur.execute(base, tuple(params))
             items = cur.fetchall()
 
-            # totali
             qsum = """
                 SELECT
                   COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
@@ -239,33 +206,26 @@ def list_movements(
             """
             p2 = []
             if _from:
-                qsum += " AND created_at >= %s"
-                p2.append(_from)
+                qsum += " AND created_at >= %s"; p2.append(_from)
             if to:
-                qsum += " AND created_at < %s"
-                p2.append(to)
+                qsum += " AND created_at < %s"; p2.append(to)
             cur.execute(qsum, tuple(p2))
             totals = cur.fetchone()
 
-        items = [{k: _d(v) for k,v in r.items()} for r in items]
-        totals = {k: _d(v) for k,v in totals.items()}
+        items  = [{k:_d(v) for k,v in r.items()} for r in items]
+        totals = {k:_d(v) for k,v in totals.items()}
         totals["net"] = _d(decimal.Decimal(str(totals["total_in"])) - decimal.Decimal(str(totals["total_out"])))
         return {"items": items, "totals": totals}
     except Exception as e:
         return JSONResponse({"error":"db_failed_query","detail":str(e)}, status_code=500)
 
-# ============ ANALYTICS ============
+# ----------------- ANALYTICS -----------------
 @app.get("/analytics/overview")
 def analytics_overview(days: int = 30):
-    """
-    Ritorna serie giornaliere in/out + net per ultimi N giorni sullo schema movements attuale.
-    """
     if days < 1 or days > 365:
         raise HTTPException(422, "days must be between 1 and 365")
-
     try:
         with db_conn() as con, con.cursor() as cur:
-            # serie giorni
             cur.execute(
                 """
                 WITH days AS (
@@ -296,7 +256,6 @@ def analytics_overview(days: int = 30):
             )
             rows = cur.fetchall()
 
-            # totali globali finestra
             cur.execute(
                 """
                 SELECT
@@ -309,33 +268,23 @@ def analytics_overview(days: int = 30):
             )
             totals = cur.fetchone()
 
-        rows = [{k: _d(v) for k,v in r.items()} for r in rows]
-        totals = {k: _d(v) for k,v in totals.items()}
+        rows = [{k:_d(v) for k,v in r.items()} for r in rows]
+        totals = {k:_d(v) for k,v in totals.items()}
         totals["net"] = _d(decimal.Decimal(str(totals["total_in"])) - decimal.Decimal(str(totals["total_out"])))
         return {"days": rows, "totals": totals}
     except Exception as e:
         return JSONResponse({"error":"db_failed_analytics","detail":str(e)}, status_code=500)
 
-# ============ SUMMARIES ============
+# ----------------- SUMMARIES -----------------
 @app.post("/summaries/generate")
 def generate_summary(days: int = 30):
-    """
-    Crea un riassunto manageriale (testo) sui dati degli ultimi N giorni.
-    Usa OpenAI se disponibile, altrimenti fallback.
-    """
-    # raccogli KPI
     try:
         with db_conn() as con, con.cursor() as cur:
             cur.execute(
-                """
-                SELECT
-                  COUNT(*) AS messages_count
-                FROM messages
-                WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
-                """, (days,)
+                "SELECT COUNT(*) AS messages_count FROM messages WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'",
+                (days,)
             )
             m = cur.fetchone()
-
             cur.execute(
                 """
                 SELECT
@@ -343,7 +292,8 @@ def generate_summary(days: int = 30):
                   COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
                 FROM movements
                 WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
-                """, (days,)
+                """,
+                (days,)
             )
             mv = cur.fetchone()
     except Exception as e:
@@ -360,16 +310,16 @@ def generate_summary(days: int = 30):
         "net": net
     }
 
-    # genera testo
-    summary_text = ""
+    summary_text = (
+        f"Ultimi {days} giorni: messaggi {kpi['messages']}, "
+        f"entrate {kpi['revenue_in']}, uscite {kpi['expenses_out']}, "
+        f"netto {kpi['net']}."
+    )
     if OPENAI_API_KEY:
         try:
             from openai import OpenAI
             oai = OpenAI(api_key=OPENAI_API_KEY)
-            prompt = (
-                "Scrivi un breve riepilogo manageriale (5-8 frasi) dei KPI:\n"
-                + json.dumps(kpi, ensure_ascii=False)
-            )
+            prompt = "Scrivi un breve riepilogo manageriale (5-8 frasi) dei KPI:\n" + json.dumps(kpi, ensure_ascii=False)
             resp = oai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role":"user","content": prompt}],
@@ -378,16 +328,6 @@ def generate_summary(days: int = 30):
             )
             summary_text = resp.choices[0].message.content.strip()
         except Exception:
-            summary_text = (
-                f"Ultimi {days} giorni: messaggi {kpi['messages']}, "
-                f"entrate {kpi['revenue_in']}, uscite {kpi['expenses_out']}, "
-                f"netto {kpi['net']}."
-            )
-    else:
-        summary_text = (
-            f"Ultimi {days} giorni: messaggi {kpi['messages']}, "
-            f"entrate {kpi['revenue_in']}, uscite {kpi['expenses_out']}, "
-            f"netto {kpi['net']}."
-        )
+            pass
 
     return {"kpi": kpi, "summary": summary_text}
