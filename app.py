@@ -1,257 +1,174 @@
 import os
-import json
-import decimal
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal
 
-import psycopg2
-import psycopg2.extras
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-# OpenAI SDK (>=1.40) – niente proxies custom
-try:
-    from openai import OpenAI
-    _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-except Exception as _e:
-    _openai_client = None
+import psycopg  # psycopg v3
+from psycopg.rows import dict_row
 
 APP = FastAPI()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# ==== ENV ====
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+API_KEY_APP    = os.getenv("API_KEY_APP", "flai_Chiasso13241")
+DATABASE_URL   = os.getenv("DATABASE_URL", "") or os.getenv("POSTGRES_URL", "")
 
-# -----------------------------
-# Helpers DB
-# -----------------------------
+# ==== SECURITY (API KEY SU TUTTO tranne "/" e "/healthz") ====
+@APP.middleware("http")
+async def api_key_guard(request: Request, call_next):
+    if request.url.path not in {"/", "/healthz"}:
+        if request.headers.get("x-api-key") != API_KEY_APP:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
-def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not set")
-    return psycopg2.connect(DATABASE_URL)
-
-def bootstrap_db():
-    """
-    Crea tabelle se non esistono (schema compatibile con il tuo DB attuale).
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # messages
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id SERIAL PRIMARY KEY,
-            content TEXT NOT NULL,
-            reply   TEXT,
-            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
-        );
-    """)
-
-    # movements (schema allineato alla foto: id, message_id, type, voce, valuta, note, created_at, amount, currency, category)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS movements (
-            id SERIAL PRIMARY KEY,
-            message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
-            type VARCHAR(10) NOT NULL,
-            voce TEXT NOT NULL DEFAULT 'generale',
-            valuta VARCHAR(8) NOT NULL DEFAULT 'CHF',
-            note  TEXT,
-            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
-            amount NUMERIC(14,2) NOT NULL,
-            currency VARCHAR(8) NOT NULL DEFAULT 'CHF',
-            category VARCHAR(50)
-        );
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-# Esegui bootstrap all'avvio
-try:
-    bootstrap_db()
-except Exception as e:
-    # non bloccare l'avvio: lo segnaliamo su /healthz
-    print("DB bootstrap error:", e, flush=True)
-
-# -----------------------------
-# Utils
-# -----------------------------
-
-def to_decimal(x):
-    if isinstance(x, (int, float, decimal.Decimal)):
-        return decimal.Decimal(str(x))
-    # stringhe tipo "123.45"
-    return decimal.Decimal(x)
-
-def ai_answer(prompt: str) -> str:
-    """
-    Chiama OpenAI; se non configurato, torna una risposta di fallback.
-    """
-    if _openai_client is None:
-        return "AI non configurata (manca OPENAI_API_KEY); risposta di fallback."
-
-    try:
-        resp = _openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Sei un assistente aziendale pratico e conciso."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=180
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"[AI fallback] Errore modello: {e}"
-
-# -----------------------------
-# Endpoints base
-# -----------------------------
-
+# ==== ROOT/HEALTH ====
 @APP.get("/")
 def root():
-    return {"status": "ok", "service": "flai-app"}
+    return {"ok": True, "service": "flai-app"}
 
 @APP.get("/healthz")
 def healthz():
-    """
-    Verifica connessione DB (senza usare 'with cursor').
-    """
+    # opzionale: probe DB veloce
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.close()
-        conn.close()
-        return {"status": "ok", "message": "FLAI API attiva 🚀"}
+        if DATABASE_URL:
+            with psycopg.connect(DATABASE_URL) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+        return {"ok": True}
     except Exception as e:
-        return {"error": "db_bootstrap_failed", "detail": str(e)}
+        return JSONResponse({"error": "db_bootstrap_failed", "detail": str(e)}, status_code=500)
 
-# -----------------------------
-# Chat AI + persistenza
-# -----------------------------
+# ==== DB HELPER (psycopg v3) ====
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not configured")
+    # open/close ad ogni richiesta: semplice e sicuro
+    return psycopg.connect(DATABASE_URL)
 
+# ==== MESSAGES (demo semplice AI OFF finché non serve) ====
 @APP.post("/messages")
 def create_message(payload: dict = Body(...)):
     """
-    Body: { "message": "testo" }
-    Salva domanda/risposta su 'messages'.
+    Body: { "message": "..." }
+    Salva la domanda + una risposta finta e ritorna la reply.
     """
-    text = (payload or {}).get("message", "").strip()
-    if not text:
-        return JSONResponse({"error": "missing_message"}, status_code=400)
+    msg = (payload or {}).get("message", "").strip()
+    if not msg:
+        raise HTTPException(422, "message is required")
 
-    reply = ai_answer(text)
+    # risposta finta per test infrastruttura
+    reply = f"Hai scritto: {msg}"
 
+    # salva su DB se esiste tabella messages (id serial, content text, reply text, created_at timestamp)
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO messages (content, reply, created_at) VALUES (%s,%s,%s) RETURNING id",
-            (text, reply, datetime.utcnow())
-        )
-        mid = cur.fetchone()[0]
-        conn.commit()
-        cur.close()
-        conn.close()
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id SERIAL PRIMARY KEY,
+                        content TEXT NOT NULL,
+                        reply   TEXT,
+                        created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    "INSERT INTO messages(content, reply, created_at) VALUES (%s,%s,%s) RETURNING id;",
+                    (msg, reply, datetime.now(timezone.utc).replace(tzinfo=None)),
+                )
+                new_id = cur.fetchone()[0]
+        return {"id": new_id, "reply": reply}
     except Exception as e:
-        return JSONResponse({"error": "db_insert_failed", "detail": str(e)}, status_code=500)
+        return JSONResponse({"error": "db_failed_insert_message", "detail": str(e)}, status_code=500)
 
-    return {"id": mid, "message": text, "reply": reply}
-
-# -----------------------------
-# Movements (entrate/uscite)
-# -----------------------------
-
+# ==== MOVEMENTS ====
 @APP.post("/movements")
 def add_movement(payload: dict = Body(...)):
     """
-    Body minimi:
+    Body:
       {
         "type": "in" | "out",
         "amount": 123.45,
-        "currency": "CHF",       # opzionale (default DB = CHF)
-        "category": "sales",     # opzionale
-        "note": "incasso giorno" # opzionale
+        "currency": "CHF",
+        "category": "sales",
+        "note": "opzionale"
       }
-    Colonne DB esistenti: (id, message_id, type, voce, valuta, note, created_at, amount, currency, category)
-    Settiamo automaticamente: voce='generale', valuta='CHF' (lasciamo i default).
     """
-    t = (payload or {}).get("type", "").strip().lower()
+    t = (payload or {}).get("type")
     if t not in ("in", "out"):
-        return JSONResponse({"error": "invalid_type", "detail": "type deve essere 'in' o 'out'."}, status_code=400)
+        raise HTTPException(422, "type must be 'in' or 'out'")
 
     try:
-        amt = to_decimal((payload or {}).get("amount"))
+        amt = Decimal(str((payload or {}).get("amount")))
     except Exception:
-        return JSONResponse({"error": "invalid_amount"}, status_code=400)
+        raise HTTPException(422, "amount must be a number")
 
-    cur_code = (payload or {}).get("currency") or None
-    cat = (payload or {}).get("category") or None
-    note = (payload or {}).get("note") or None
+    cur_ = (payload or {}).get("currency", "CHF") or "CHF"
+    cat = (payload or {}).get("category")
+    note = (payload or {}).get("note")
 
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO movements (type, amount, currency, category, note)
-            VALUES (%s, %s, COALESCE(%s,'CHF'), %s, %s)
-            RETURNING id, created_at
-            """,
-            (t, amt, cur_code, cat, note)
-        )
-        rid = cur.fetchone()
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"status": "ok", "id": rid[0], "created_at": rid[1].isoformat()}
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                # bootstrap tabella se manca (schema semplice e coerente)
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS movements (
+                        id SERIAL PRIMARY KEY,
+                        type VARCHAR(10) NOT NULL,
+                        amount NUMERIC(14,2) NOT NULL,
+                        currency VARCHAR(8) NOT NULL DEFAULT 'CHF',
+                        category VARCHAR(50),
+                        note TEXT,
+                        created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO movements(type, amount, currency, category, note, created_at)
+                    VALUES (%s,%s,%s,%s,%s,NOW())
+                    RETURNING id;
+                    """,
+                    (t, amt, cur_, cat, note),
+                )
+                new_id = cur.fetchone()[0]
+        return {"ok": True, "id": new_id}
     except Exception as e:
         return JSONResponse({"error": "db_failed_insert", "detail": str(e)}, status_code=500)
 
 @APP.get("/movements")
-def list_movements(limit: int = 200):
-    """
-    Lista ultimi movimenti + totali in/out/netto.
-    """
+def list_movements():
     try:
-        conn = get_conn()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-        cur.execute(
-            """
-            SELECT id, type, amount, currency, category, note, created_at
-            FROM movements
-            ORDER BY created_at DESC
-            LIMIT %s
-            """,
-            (limit,)
-        )
-        rows = cur.fetchall()
-
-        cur.execute(
-            """
-            SELECT
-              COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS total_in,
-              COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS total_out
-            FROM movements
-            """
-        )
-        totals = cur.fetchone()
-
-        cur.close()
-        conn.close()
-
-        # serializza Decimal -> float
-        for r in rows:
-            if isinstance(r.get("amount"), decimal.Decimal):
-                r["amount"] = float(r["amount"])
-        if isinstance(totals.get("total_in"), decimal.Decimal):
-            totals["total_in"] = float(totals["total_in"])
-        if isinstance(totals.get("total_out"), decimal.Decimal):
-            totals["total_out"] = float(totals["total_out"])
-        totals["net"] = totals["total_in"] - totals["total_out"]
-
-        return {"items": rows, "totals": totals}
-
+        with db_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT id, type, amount, currency, category, note, created_at
+                    FROM movements
+                    ORDER BY created_at DESC
+                    LIMIT 200;
+                    """
+                )
+                rows = cur.fetchall()
+        return {"items": rows}
     except Exception as e:
         return JSONResponse({"error": "db_failed_query", "detail": str(e)}, status_code=500)
+
+# ==== WEBHOOK META (verifica) ====
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "flai-verify-123")
+
+@APP.get("/webhook")
+def whatsapp_verify(
+    hub_mode: str = "",
+    hub_challenge: str = "",
+    hub_verify_token: str = "",
+):
+    if hub_mode == "subscribe" and hub_verify_token == META_VERIFY_TOKEN:
+        return PlainTextResponse(hub_challenge or "", media_type="text/plain")
+    raise HTTPException(status_code=403, detail="verification_failed")
+
