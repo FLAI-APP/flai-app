@@ -1,142 +1,74 @@
 import os
 import json
-import psycopg2
+import datetime
+import pg8000
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from openai import OpenAI
 
-# ---------------------------
-# Configurazione OpenAI
-# ---------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY non trovata nelle variabili d'ambiente")
+app = FastAPI()
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ---------------------------
-# Configurazione FastAPI
-# ---------------------------
-app = FastAPI(title="FLAI App", version="1.0.0")
-
-# ---------------------------
-# Connessione DB
-# ---------------------------
-def get_db_connection():
-    conn = psycopg2.connect(
-        host=os.getenv("DB_HOST"),
-        dbname=os.getenv("DB_NAME"),
+# Connessione al DB
+def get_db():
+    conn = pg8000.connect(
         user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"),
-        port=os.getenv("DB_PORT", 5432),
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT", 5432)),
+        database=os.getenv("DB_NAME"),
     )
     return conn
 
-# ---------------------------
-# Root endpoint
-# ---------------------------
 @app.get("/")
-def root():
-    return {"status": "ok", "message": "FLAI App attiva 🚀"}
+def home():
+    return {"status": "ok", "message": "FLAI API attiva 🚀"}
 
-# ---------------------------
-# Movements endpoint
-# ---------------------------
-@app.get("/movements")
-def get_movements(limit: int = 10):
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT description, amount, date FROM movements ORDER BY date DESC LIMIT %s",
-            (limit,)
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
+# Movimenti (entrate/uscite)
+@app.post("/movements")
+async def add_movement(request: Request):
+    data = await request.json()
+    type_ = data.get("type")
+    amount = data.get("amount")
 
-        movements = [
-            {"date": r[2].isoformat(), "description": r[0], "amount": float(r[1])}
-            for r in rows
-        ]
-        return {"movements": movements}
+    if type_ not in ["in", "out"] or amount is None:
+        raise HTTPException(status_code=400, detail="Dati non validi")
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO movements (type, amount, created_at) VALUES (%s, %s, %s)",
+        (type_, amount, datetime.datetime.utcnow())
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
 
-# ---------------------------
-# Generate Summary endpoint
-# ---------------------------
-@app.post("/summaries/generate")
-async def generate_summary(request: Request, days: int = 30):
-    try:
-        data = await request.json()
+    return {"status": "success"}
 
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT description, amount, date FROM movements WHERE date >= NOW() - INTERVAL '%s days' ORDER BY date DESC",
-            (days,)
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        if not rows:
-            return {"summary": f"Nessun movimento trovato negli ultimi {days} giorni."}
-
-        text_data = "\n".join([f"{r[2]} - {r[0]}: {r[1]} CHF" for r in rows])
-
-        prompt = f"""
-        Sei un assistente finanziario.
-        Riassumi le seguenti transazioni degli ultimi {days} giorni in modo chiaro e utile:
-
-        {text_data}
+# Analytics di base
+@app.get("/analytics/overview")
+def analytics(days: int = 7):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
         """
+        SELECT 
+          DATE(created_at) as d,
+          COALESCE(SUM(CASE WHEN type='in'  THEN amount END), 0) as in_amt,
+          COALESCE(SUM(CASE WHEN type='out' THEN amount END), 0) as out_amt
+        FROM movements
+        WHERE created_at >= CURRENT_DATE - INTERVAL '%s days'
+        GROUP BY DATE(created_at)
+        ORDER BY d ASC;
+        """,
+        (days,)
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
 
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Sei un assistente finanziario esperto."},
-                {"role": "user", "content": prompt}
-            ]
-        )
+    result = [
+        {"date": str(r[0]), "in": float(r[1]), "out": float(r[2]), "net": float(r[1]) - float(r[2])}
+        for r in rows
+    ]
 
-        summary = completion.choices[0].message.content
-        return {"summary": summary}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ---------------------------
-# Analytics endpoint
-# ---------------------------
-@app.get("/analytics")
-def analytics():
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT SUM(amount), AVG(amount) FROM movements")
-        total, avg = cur.fetchone()
-        cur.close()
-        conn.close()
-
-        return {
-            "total": float(total) if total else 0,
-            "average": float(avg) if avg else 0,
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ---------------------------
-# Webhook endpoint
-# ---------------------------
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        payload = await request.json()
-        print("Webhook ricevuto:", json.dumps(payload, indent=2))
-        return JSONResponse(content={"status": "received", "data": payload})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return result
