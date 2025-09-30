@@ -2,6 +2,10 @@ import os
 import time
 import json
 from typing import Optional
+import datetime as dt
+from io import StringIO
+import csv
+from fastapi.responses import StreamingResponse
 
 import psycopg
 from psycopg.rows import dict_row
@@ -241,3 +245,169 @@ async def whatsapp_events(payload: dict = Body(...)):
         return {"status": "ok"}
 
 
+# -----------------------------------------------------------------------------
+# REPORT & EXPORT
+# -----------------------------------------------------------------------------
+
+def _parse_iso_date(s: str | None) -> dt.date | None:
+    if not s:
+        return None
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        return None
+
+@APP.get("/reports/weekly")
+async def report_weekly(days: int = 7, category: str | None = None):
+    """
+    Ritorna un report degli ultimi N giorni (default 7):
+    - totali IN/OUT/NET
+    - serie giornaliera [{date, in, out, net}]
+    - breakdown per categoria (top 10)
+    Filtrabile per category (opzionale).
+    """
+    if days < 1 or days > 90:
+        raise HTTPException(422, detail="days must be between 1 and 90")
+
+    try:
+        with get_conn() as conn, conn.cursor() as c:
+            # Serie giornaliera
+            c.execute(
+                """
+                WITH days AS (
+                  SELECT generate_series(
+                    (CURRENT_DATE - (%s - 1) * INTERVAL '1 day')::date,
+                    CURRENT_DATE::date,
+                    INTERVAL '1 day'
+                  )::date AS d
+                ),
+                agg AS (
+                  SELECT
+                    DATE(created_at) AS d,
+                    COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS in_amt,
+                    COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS out_amt
+                  FROM movements
+                  WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
+                    AND (%s IS NULL OR category = %s)
+                  GROUP BY DATE(created_at)
+                )
+                SELECT
+                  days.d::text AS date,
+                  COALESCE(agg.in_amt,0)::text  AS "in",
+                  COALESCE(agg.out_amt,0)::text AS "out",
+                  (COALESCE(agg.in_amt,0) - COALESCE(agg.out_amt,0))::text AS net
+                FROM days
+                LEFT JOIN agg ON agg.d = days.d
+                ORDER BY days.d ASC
+                """,
+                (days, days, category, category),
+            )
+            by_day = c.fetchall()
+
+            # Totale periodo
+            c.execute(
+                """
+                SELECT
+                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)::text  AS total_in,
+                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0)::text  AS total_out,
+                  (COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)
+                   - COALESCE(SUM(CASE WHEN type='out' THEN amount END),0))::text AS net
+                FROM movements
+                WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
+                  AND (%s IS NULL OR category = %s)
+                """,
+                (days, category, category),
+            )
+            totals = c.fetchone()
+
+            # Breakdown per categoria (top 10 per volume assoluto)
+            c.execute(
+                """
+                SELECT
+                  COALESCE(category,'(senza categoria)') AS category,
+                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)::text  AS in_amt,
+                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0)::text AS out_amt,
+                  (COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)
+                   - COALESCE(SUM(CASE WHEN type='out' THEN amount END),0))::text AS net
+                FROM movements
+                WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
+                GROUP BY COALESCE(category,'(senza categoria)')
+                ORDER BY ABS(
+                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)
+                + COALESCE(SUM(CASE WHEN type='out' THEN amount END),0)
+                ) DESC
+                LIMIT 10
+                """,
+                (days,),
+            )
+            by_category = c.fetchall()
+
+        return {
+            "window_days": days,
+            "filter_category": category,
+            "totals": totals,
+            "by_day": by_day,
+            "by_category": by_category,
+        }
+    except Exception as e:
+        return JSONResponse({"error": "db_failed_report", "detail": str(e)}, status_code=500)
+
+
+@APP.get("/export/movements.csv")
+async def export_movements_csv(
+    _from: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    category: str | None = None,
+):
+    """
+    Esporta i movimenti in CSV (scaricabile).
+    Filtri: from (YYYY-MM-DD), to (YYYY-MM-DD), category.
+    """
+    d_from = _parse_iso_date(_from)
+    d_to = _parse_iso_date(to)
+
+    try:
+        with get_conn() as conn, conn.cursor() as c:
+            q = """
+                SELECT id, type, amount, currency, category, note, created_at
+                FROM movements
+                WHERE 1=1
+            """
+            params: list = []
+            if d_from:
+                q += " AND created_at::date >= %s"
+                params.append(d_from)
+            if d_to:
+                q += " AND created_at::date <= %s"
+                params.append(d_to)
+            if category:
+                q += " AND category = %s"
+                params.append(category)
+            q += " ORDER BY created_at DESC"
+            c.execute(q, params)
+            rows = c.fetchall()
+
+        # Genera CSV in memoria
+        buf = StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["id", "type", "amount", "currency", "category", "note", "created_at"])  # header
+        for r in rows:
+            writer.writerow([
+                r["id"],
+                r["type"],
+                r["amount"],
+                r["currency"],
+                r["category"] or "",
+                (r["note"] or "").replace("\n", " ").strip(),
+                r["created_at"].isoformat(sep=" ", timespec="seconds") if r.get("created_at") else "",
+            ])
+        buf.seek(0)
+
+        filename = "movements_export.csv"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
+        return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers=headers)
+
+    except Exception as e:
+        return JSONResponse({"error": "db_failed_export", "detail": str(e)}, status_code=500)
