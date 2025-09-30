@@ -341,6 +341,64 @@ async def report_weekly(days: int = 7, category: str | None = None):
     except Exception as e:
         return {"error": "db_failed_report", "detail": str(e)}
 
+# ------------------------------------------------------------------
+# REPORT: MONTHLY (totali per mese, con filtro opzionale di categoria)
+# ------------------------------------------------------------------
+
+from fastapi import Query  # (se l'hai già importato sopra, questa riga non dà fastidio)
+
+@APP.get("/reports/monthly")
+async def reports_monthly(
+    months: int = Query(6, ge=1, le=24, description="Numero di mesi da oggi a ritroso"),
+    category: str | None = None,
+):
+    """
+    Riepilogo per mese degli ultimi N mesi (default 6).
+    - Somma 'in', 'out' e 'net' per ciascun mese.
+    - Filtro opzionale per categoria (es. ?category=sales).
+    - Ordine cronologico crescente (dal mese più vecchio al più recente).
+    """
+    sql = """
+        WITH months AS (
+          SELECT (date_trunc('month', CURRENT_DATE) - (INTERVAL '1 month' * gs))::date AS m_start
+          FROM generate_series(0, %s - 1) AS gs
+        )
+        SELECT
+          to_char(m.m_start, 'YYYY-MM') AS month,
+          COALESCE(SUM(CASE WHEN mv.type='in'  THEN mv.amount END), 0) AS in_amt,
+          COALESCE(SUM(CASE WHEN mv.type='out' THEN mv.amount END), 0) AS out_amt
+        FROM months m
+        LEFT JOIN movements mv
+          ON date_trunc('month', mv.created_at) = m.m_start
+         AND (%s IS NULL OR mv.category = %s)
+        GROUP BY m.m_start
+        ORDER BY m.m_start ASC;
+    """
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            # NB: months è usato solo nel generate_series; category viene passato due volte
+            cur.execute(sql, (months, category, category))
+            rows = cur.fetchall()
+
+        series = []
+        for r in rows:
+            month, in_amt, out_amt = r["month"], float(r["in_amt"]), float(r["out_amt"])
+            series.append({
+                "month": month,
+                "in": in_amt,
+                "out": out_amt,
+                "net": round(in_amt - out_amt, 2),
+            })
+
+        return {
+            "ok": True,
+            "months": months,
+            "category": category,
+            "series": series
+        }
+    except Exception as e:
+        return {"error": "db_failed_report_monthly", "detail": str(e)}
+
 
 @APP.get("/export/movements.csv")
 async def export_movements_csv(
