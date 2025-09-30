@@ -260,97 +260,86 @@ def _parse_iso_date(s: str | None) -> dt.date | None:
 @APP.get("/reports/weekly")
 async def report_weekly(days: int = 7, category: str | None = None):
     """
-    Ritorna un report degli ultimi N giorni (default 7):
-    - totali IN/OUT/NET
-    - serie giornaliera [{date, in, out, net}]
-    - breakdown per categoria (top 10)
-    Filtrabile per category (opzionale).
+    Ritorna un report giornaliero degli ultimi `days` giorni:
+    per ogni giorno: IN, OUT e NET. Se `category` è indicata, filtra per categoria.
+
+    Nota: per evitare problemi di cast nei parametri SQL, calcoliamo in Python la data di inizio
+    e la passiamo come DATE a Postgres. Così niente placeholder dentro INTERVAL.
     """
-    if days < 1 or days > 90:
-        raise HTTPException(422, detail="days must be between 1 and 90")
+    from datetime import date, timedelta
+
+    if days < 1:
+        days = 1
+
+    start_date = date.today() - timedelta(days=days - 1)
 
     try:
-        with get_conn() as conn, conn.cursor() as c:
-            # Serie giornaliera
-            c.execute(
-                """
-                WITH days AS (
-                  SELECT generate_series(
-                    (CURRENT_DATE - (%s - 1) * INTERVAL '1 day')::date,
-                    CURRENT_DATE::date,
-                    INTERVAL '1 day'
-                  )::date AS d
-                ),
-                agg AS (
-                  SELECT
-                    DATE(created_at) AS d,
-                    COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0) AS in_amt,
-                    COALESCE(SUM(CASE WHEN type='out' THEN amount END),0) AS out_amt
-                  FROM movements
-                  WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
-                    AND (%s IS NULL OR category = %s)
-                  GROUP BY DATE(created_at)
+        with get_conn() as conn, conn.cursor() as cur:
+            # 1) generiamo i giorni a partire da start_date fino a oggi (incluso)
+            # 2) aggreghiamo movements per giorno (e opzionale categoria)
+            # 3) left join per includere giorni senza movimenti
+            if category:
+                cur.execute(
+                    """
+                    WITH days AS (
+                      SELECT generate_series(%s::date, CURRENT_DATE::date, INTERVAL '1 day')::date AS d
+                    ),
+                    agg AS (
+                      SELECT
+                        DATE(created_at) AS d,
+                        COALESCE(SUM(CASE WHEN type='in'  THEN amount END), 0) AS in_amt,
+                        COALESCE(SUM(CASE WHEN type='out' THEN amount END), 0) AS out_amt
+                      FROM movements
+                      WHERE created_at >= %s::date
+                        AND category = %s
+                      GROUP BY DATE(created_at)
+                    )
+                    SELECT
+                      days.d                       AS date,
+                      COALESCE(agg.in_amt, 0)      AS in,
+                      COALESCE(agg.out_amt, 0)     AS out,
+                      COALESCE(agg.in_amt, 0) - COALESCE(agg.out_amt, 0) AS net
+                    FROM days
+                    LEFT JOIN agg ON agg.d = days.d
+                    ORDER BY days.d ASC
+                    """,
+                    (start_date, start_date, category),
                 )
-                SELECT
-                  days.d::text AS date,
-                  COALESCE(agg.in_amt,0)::text  AS "in",
-                  COALESCE(agg.out_amt,0)::text AS "out",
-                  (COALESCE(agg.in_amt,0) - COALESCE(agg.out_amt,0))::text AS net
-                FROM days
-                LEFT JOIN agg ON agg.d = days.d
-                ORDER BY days.d ASC
-                """,
-                (days, days, category, category),
-            )
-            by_day = c.fetchall()
+            else:
+                cur.execute(
+                    """
+                    WITH days AS (
+                      SELECT generate_series(%s::date, CURRENT_DATE::date, INTERVAL '1 day')::date AS d
+                    ),
+                    agg AS (
+                      SELECT
+                        DATE(created_at) AS d,
+                        COALESCE(SUM(CASE WHEN type='in'  THEN amount END), 0) AS in_amt,
+                        COALESCE(SUM(CASE WHEN type='out' THEN amount END), 0) AS out_amt
+                      FROM movements
+                      WHERE created_at >= %s::date
+                      GROUP BY DATE(created_at)
+                    )
+                    SELECT
+                      days.d                       AS date,
+                      COALESCE(agg.in_amt, 0)      AS in,
+                      COALESCE(agg.out_amt, 0)     AS out,
+                      COALESCE(agg.in_amt, 0) - COALESCE(agg.out_amt, 0) AS net
+                    FROM days
+                    LEFT JOIN agg ON agg.d = days.d
+                    ORDER BY days.d ASC
+                    """,
+                    (start_date, start_date),
+                )
 
-            # Totale periodo
-            c.execute(
-                """
-                SELECT
-                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)::text  AS total_in,
-                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0)::text  AS total_out,
-                  (COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)
-                   - COALESCE(SUM(CASE WHEN type='out' THEN amount END),0))::text AS net
-                FROM movements
-                WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
-                  AND (%s IS NULL OR category = %s)
-                """,
-                (days, category, category),
-            )
-            totals = c.fetchone()
-
-            # Breakdown per categoria (top 10 per volume assoluto)
-            c.execute(
-                """
-                SELECT
-                  COALESCE(category,'(senza categoria)') AS category,
-                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)::text  AS in_amt,
-                  COALESCE(SUM(CASE WHEN type='out' THEN amount END),0)::text AS out_amt,
-                  (COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)
-                   - COALESCE(SUM(CASE WHEN type='out' THEN amount END),0))::text AS net
-                FROM movements
-                WHERE created_at >= CURRENT_DATE - (%s - 1) * INTERVAL '1 day'
-                GROUP BY COALESCE(category,'(senza categoria)')
-                ORDER BY ABS(
-                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END),0)
-                + COALESCE(SUM(CASE WHEN type='out' THEN amount END),0)
-                ) DESC
-                LIMIT 10
-                """,
-                (days,),
-            )
-            by_category = c.fetchall()
-
-        return {
-            "window_days": days,
-            "filter_category": category,
-            "totals": totals,
-            "by_day": by_day,
-            "by_category": by_category,
-        }
+            rows = cur.fetchall()
+            result = [
+                {"date": str(r["date"]), "in": float(r["in"]), "out": float(r["out"]), "net": float(r["net"])}
+                for r in rows
+            ]
+            return {"ok": True, "days": days, "category": category, "series": result}
     except Exception as e:
-        return JSONResponse({"error": "db_failed_report", "detail": str(e)}, status_code=500)
+        return {"error": "db_failed_report", "detail": str(e)}
 
 
 @APP.get("/export/movements.csv")
