@@ -6,6 +6,7 @@ import datetime as dt
 from io import StringIO
 import csv
 from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 
 import psycopg
 from psycopg.rows import dict_row
