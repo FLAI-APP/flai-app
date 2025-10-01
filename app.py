@@ -459,3 +459,123 @@ async def export_movements_csv(
 
     except Exception as e:
         return JSONResponse({"error": "db_failed_export", "detail": str(e)}, status_code=500)
+
+# ================================
+# REPORT: YEARLY & CUSTOM
+# ================================
+import datetime as dt
+from fastapi import Query
+
+def _clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+@APP.get("/reports/yearly")
+async def report_yearly(
+    years: int = Query(5, ge=1, le=50, description="Quanti anni (incluso l'anno corrente)"),
+    category: str | None = Query(None, description="Filtra per categoria (opzionale)"),
+):
+    """
+    Serie annuale (ultimi 'years' anni fino all'anno corrente).
+    Output: [{year, in, out, net}, ...]
+    """
+    try:
+        years = _clamp(years, 1, 50)
+        with get_conn() as conn, conn.cursor() as c:
+            # Serie di anni (date al 1° gennaio) e aggregati per anno
+            q = """
+                WITH years AS (
+                  SELECT generate_series(
+                    date_trunc('year', CURRENT_DATE) - ((%s::int - 1) * INTERVAL '1 year'),
+                    date_trunc('year', CURRENT_DATE),
+                    INTERVAL '1 year'
+                  )::date AS y
+                ),
+                agg AS (
+                  SELECT
+                    date_trunc('year', created_at)::date AS y,
+                    COALESCE(SUM(CASE WHEN type='in'  THEN amount END), 0) AS in_amt,
+                    COALESCE(SUM(CASE WHEN type='out' THEN amount END), 0) AS out_amt
+                  FROM movements
+                  WHERE created_at >= date_trunc('year', CURRENT_DATE) - ((%s::int - 1) * INTERVAL '1 year')
+                    AND created_at <  date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
+                    {cat_filter}
+                  GROUP BY date_trunc('year', created_at)::date
+                )
+                SELECT
+                  EXTRACT(YEAR FROM years.y)::int AS year,
+                  COALESCE(agg.in_amt,0)  AS in,
+                  COALESCE(agg.out_amt,0) AS out,
+                  COALESCE(agg.in_amt,0) - COALESCE(agg.out_amt,0) AS net
+                FROM years
+                LEFT JOIN agg ON agg.y = years.y
+                ORDER BY years.y ASC
+            """
+            params: list = [years, years]
+            cat_filter = ""
+            if category:
+                cat_filter = "AND category = %s"
+                params.append(category)
+            q = q.format(cat_filter=cat_filter)
+
+            c.execute(q, params)
+            rows = c.fetchall()
+
+        series = [
+            {"year": r["year"], "in": float(r["in"]), "out": float(r["out"]), "net": float(r["net"])}
+            for r in rows
+        ]
+        return {"ok": True, "years": years, "category": category, "series": series}
+    except Exception as e:
+        return {"error": "db_failed_report_yearly", "detail": str(e)}
+
+@APP.get("/reports/custom")
+async def report_custom(
+    from_: str = Query(..., alias="from", description="Data inizio (YYYY-MM-DD)"),
+    to:   str = Query(..., description="Data fine inclusa (YYYY-MM-DD)"),
+    category: str | None = Query(None, description="Filtra per categoria (opzionale)"),
+):
+    """
+    Totali su un range personalizzato [from, to].
+    Output: { totals: {in, out, net} }
+    """
+    # Parse date sicuro
+    try:
+        d_from = dt.date.fromisoformat(from_)
+        d_to   = dt.date.fromisoformat(to)
+    except Exception:
+        return {"error": "bad_dates", "detail": "Usa formato YYYY-MM-DD per 'from' e 'to'."}
+    if d_from > d_to:
+        return {"error": "bad_range", "detail": "'from' deve essere <= 'to'."}
+
+    try:
+        with get_conn() as conn, conn.cursor() as c:
+            q = """
+                SELECT
+                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END), 0) AS in_amt,
+                  COALESCE(SUM(CASE WHEN type='out' THEN amount END), 0) AS out_amt
+                FROM movements
+                WHERE created_at::date BETWEEN %s AND %s
+                {cat_filter}
+            """
+            params: list = [d_from, d_to]
+            cat_filter = ""
+            if category:
+                cat_filter = "AND category = %s"
+                params.append(category)
+            q = q.format(cat_filter=cat_filter)
+
+            c.execute(q, params)
+            r = c.fetchone()
+
+        in_amt  = float(r["in_amt"])
+        out_amt = float(r["out_amt"])
+        return {
+            "ok": True,
+            "from": d_from.isoformat(),
+            "to": d_to.isoformat(),
+            "category": category,
+            "totals": {"in": in_amt, "out": out_amt, "net": in_amt - out_amt},
+        }
+    except Exception as e:
+        return {"error": "db_failed_report_custom", "detail": str(e)}
+
