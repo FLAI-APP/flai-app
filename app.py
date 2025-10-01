@@ -370,10 +370,11 @@ async def reports_monthly(
         FROM months m
         LEFT JOIN movements mv
           ON date_trunc('month', mv.created_at) = m.m_start
-         AND (%s IS NULL OR mv.category = %s)
+         AND (%s::text IS NULL OR mv.category = %s::text)
         GROUP BY m.m_start
         ORDER BY m.m_start ASC;
     """
+
     try:
         with get_conn() as conn, conn.cursor() as cur:
             # NB: months è usato solo nel generate_series; category viene passato due volte
