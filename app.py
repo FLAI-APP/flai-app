@@ -711,3 +711,119 @@ async def report_pdf(
         )
     except Exception as e:
         return {"error": "pdf_failed", "detail": str(e)}
+
+# ======================================================================
+# EMAIL SENDER (append-only block)
+# ======================================================================
+import os, asyncio
+from typing import Optional
+from email.message import EmailMessage
+import smtplib
+import httpx
+from fastapi import Request
+
+def _smtp_settings():
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USERNAME")
+    pwd  = os.getenv("SMTP_PASSWORD")
+    mail_from = os.getenv("MAIL_FROM")
+    mail_to_default = os.getenv("MAIL_TO")
+    missing = [k for k,v in {
+        "SMTP_HOST":host, "SMTP_PORT":port, "SMTP_USERNAME":user,
+        "SMTP_PASSWORD":pwd, "MAIL_FROM":mail_from
+    }.items() if v in (None,"")]
+    if missing:
+        raise RuntimeError(f"Missing SMTP settings: {', '.join(missing)}")
+    return host, port, user, pwd, mail_from, mail_to_default
+
+async def _send_email_async(msg: EmailMessage):
+    host, port, user, pwd, _, _ = _smtp_settings()
+    def _send():
+        with smtplib.SMTP(host, port) as s:
+            s.starttls()
+            s.login(user, pwd)
+            s.send_message(msg)
+    await asyncio.to_thread(_send)
+
+def _build_text_email(subject: str, body: str, to: str) -> EmailMessage:
+    _, _, _, _, mail_from, _ = _smtp_settings()
+    m = EmailMessage()
+    m["From"] = mail_from
+    m["To"] = to
+    m["Subject"] = subject
+    m.set_content(body)
+    return m
+
+@app.post("/email/test")
+async def email_test(payload: dict):
+    """
+    Body: {"email":"dest@dominio.tld","msg":"Ciao"}
+    Se 'email' manca usa MAIL_TO.
+    """
+    _, _, _, _, _, mail_to_default = _smtp_settings()
+    to = (payload or {}).get("email") or mail_to_default
+    if not to:
+        return {"ok": False, "error":"missing_to", "detail":"Passa 'email' o configura MAIL_TO"}
+    msg_text = (payload or {}).get("msg") or "Test FLAI: tutto ok ✅"
+    msg = _build_text_email("FLAI • Test email", msg_text, to)
+    await _send_email_async(msg)
+    return {"ok": True, "sent_to": to}
+
+@app.post("/reports/email")
+async def email_report(request: Request, payload: dict):
+    """
+    Body:
+      {
+        "from": "YYYY-MM-DD",  # opz
+        "to": "YYYY-MM-DD",    # opz
+        "category": "sales",   # opz
+        "email": "dest@dominio.tld" # opz (default MAIL_TO)
+      }
+    """
+    _, _, _, _, _, mail_to_default = _smtp_settings()
+    to = (payload or {}).get("email") or mail_to_default
+    if not to:
+        return {"ok": False, "error":"missing_to", "detail":"Passa 'email' o configura MAIL_TO"}
+
+    q_from = (payload or {}).get("from")
+    q_to = (payload or {}).get("to")
+    category = (payload or {}).get("category")
+
+    port = os.getenv("PORT", "10000")
+    api_key = os.getenv("API_KEY_APP", "")
+    query = []
+    if q_from:    query.append(f"from={q_from}")
+    if q_to:      query.append(f"to={q_to}")
+    if category:  query.append(f"category={category}")
+    qs = "&".join(query)
+
+    pdf_url = f"http://127.0.0.1:{port}/reports/pdf"
+    if qs:
+        pdf_url += f"?{qs}"
+
+    headers = {"X-API-Key": api_key} if api_key else {}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(pdf_url, headers=headers)
+        if r.status_code != 200 or r.headers.get("content-type","").lower() != "application/pdf":
+            return {"ok": False, "error":"pdf_fetch_failed", "status": r.status_code, "text": r.text}
+        pdf_bytes = r.content
+        # prova a leggere filename dal Content-Disposition; fallback
+        cd = r.headers.get("content-disposition", "")
+        filename = "report.pdf"
+        if "filename=" in cd:
+            filename = cd.split("filename=")[-1].strip('"; ')
+
+    _, _, _, _, mail_from, _ = _smtp_settings()
+    msg = EmailMessage()
+    msg["From"] = mail_from
+    msg["To"] = to
+    parts = ["FLAI • Report"]
+    if q_from or q_to: parts.append(f"({q_from or '…'} → {q_to or '…'})")
+    if category:       parts.append(f"[{category}]")
+    msg["Subject"] = " ".join(parts)
+    msg.set_content("In allegato il report in PDF generato da FLAI.")
+    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=filename)
+
+    await _send_email_async(msg)
+    return {"ok": True, "sent_to": to, "bytes": len(pdf_bytes), "filename": filename}
