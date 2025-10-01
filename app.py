@@ -579,3 +579,134 @@ async def report_custom(
     except Exception as e:
         return {"error": "db_failed_report_custom", "detail": str(e)}
 
+# ================================
+# REPORT PDF (range personalizzato)
+# ================================
+from io import BytesIO
+
+@APP.get("/reports/pdf")
+async def report_pdf(
+    from_: str = Query(..., alias="from", description="Data inizio (YYYY-MM-DD)"),
+    to:   str = Query(..., description="Data fine inclusa (YYYY-MM-DD)"),
+    category: str | None = Query(None, description="Categoria opzionale"),
+    limit_items: int = Query(50, ge=0, le=500, description="Quanti movimenti mostrare nel PDF (max 500)")
+):
+    """
+    Genera un PDF con:
+      - periodo richiesto
+      - totali (in/out/net)
+      - tabellina ultimi N movimenti del periodo (max 500)
+    """
+    # 1) parse date sicuro
+    try:
+        d_from = dt.date.fromisoformat(from_)
+        d_to   = dt.date.fromisoformat(to)
+    except Exception:
+        return {"error": "bad_dates", "detail": "Usa YYYY-MM-DD per 'from' e 'to'."}
+    if d_from > d_to:
+        return {"error": "bad_range", "detail": "'from' deve essere <= 'to'."}
+
+    # 2) leggi dati dal DB
+    try:
+        with get_conn() as conn, conn.cursor() as c:
+            # totali
+            q_tot = """
+                SELECT
+                  COALESCE(SUM(CASE WHEN type='in'  THEN amount END), 0) AS in_amt,
+                  COALESCE(SUM(CASE WHEN type='out' THEN amount END), 0) AS out_amt
+                FROM movements
+                WHERE created_at::date BETWEEN %s AND %s
+                {cat_filter}
+            """
+            params = [d_from, d_to]
+            cat_filter = ""
+            if category:
+                cat_filter = "AND category = %s"
+                params.append(category)
+            q_tot = q_tot.format(cat_filter=cat_filter)
+            c.execute(q_tot, params)
+            r = c.fetchone()
+            in_amt  = float(r["in_amt"])
+            out_amt = float(r["out_amt"])
+            net_amt = in_amt - out_amt
+
+            # ultimi N movimenti
+            q_mov = f"""
+                SELECT id, type, amount, currency, category, note, created_at
+                FROM movements
+                WHERE created_at::date BETWEEN %s AND %s
+                {cat_filter}
+                ORDER BY created_at DESC
+                LIMIT %s
+            """.format(cat_filter=cat_filter)
+            params_mov = [d_from, d_to] + ([category] if category else []) + [limit_items]
+            c.execute(q_mov, params_mov)
+            movs = c.fetchall()
+    except Exception as e:
+        return {"error": "db_failed_report_pdf", "detail": str(e)}
+
+    # 3) genera PDF (ReportLab)
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+        buf = BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=A4, title="FLAI - Report")
+        styles = getSampleStyleSheet()
+        story = []
+
+        title = f"FLAI – Report {d_from.isoformat()} → {d_to.isoformat()}"
+        if category:
+            title += f"  (categoria: {category})"
+        story.append(Paragraph(title, styles["Title"]))
+        story.append(Spacer(1, 8))
+
+        story.append(Paragraph(
+            f"<b>Totali</b>: Entrate = <b>{in_amt:,.2f}</b>  |  Uscite = <b>{out_amt:,.2f}</b>  |  Netto = <b>{net_amt:,.2f}</b>",
+            styles["Normal"]
+        ))
+        story.append(Spacer(1, 12))
+
+        # tabella movimenti (se presenti)
+        data = [["ID", "Tipo", "Importo", "Valuta", "Categoria", "Nota", "Data/Ora"]]
+        for m in movs:
+            data.append([
+                m["id"],
+                m["type"],
+                f"{float(m['amount']):,.2f}",
+                m["currency"],
+                m["category"] or "",
+                (m["note"] or "")[:40],
+                m["created_at"].strftime("%Y-%m-%d %H:%M"),
+            ])
+        if len(data) > 1:
+            t = Table(data, repeatRows=1)
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+                ("TEXTCOLOR", (0,0), (-1,0), colors.black),
+                ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+                ("ALIGN", (2,1), (2,-1), "RIGHT"),
+            ]))
+            story.append(Paragraph(f"Movimenti mostrati: {len(data)-1}", styles["Heading4"]))
+            story.append(t)
+        else:
+            story.append(Paragraph("Nessun movimento nel periodo selezionato.", styles["Italic"]))
+
+        doc.build(story)
+        pdf_bytes = buf.getvalue()
+        buf.close()
+
+        fname = f"flai-report_{d_from.isoformat()}_{d_to.isoformat()}"
+        if category:
+            fname += f"_{category}"
+        fname += ".pdf"
+
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+        )
+    except Exception as e:
+        return {"error": "pdf_failed", "detail": str(e)}
