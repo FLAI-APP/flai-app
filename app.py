@@ -899,3 +899,156 @@ async def email_report(
 # === FINE EMAIL ===============================================================
 
 
+# ========== DASHBOARD WEB (lite) ==========
+from fastapi.responses import HTMLResponse
+import json as _json
+import datetime as dt
+
+@APP.get("/dashboard", response_class=HTMLResponse, summary="Dashboard web (ultimi 30 giorni)")
+async def dashboard():
+    """
+    Mostra:
+      - tabella ultimi 30 giorni (movimenti)
+      - grafico giornaliero in/out/net
+      - totali periodo
+    """
+    d_to = dt.date.today()
+    d_from = d_to - dt.timedelta(days=29)
+
+    # 1) leggi movimenti dal DB
+    with get_conn() as conn, conn.cursor() as c:
+        c.execute(
+            """
+            SELECT id, type, amount, currency, category, note, created_at::date AS d
+            FROM movements
+            WHERE created_at::date BETWEEN %s AND %s
+            ORDER BY created_at DESC
+            """,
+            (d_from, d_to),
+        )
+        rows = c.fetchall()
+
+    # 2) prepara tabella + serie daily
+    cols = ["id", "type", "amount", "currency", "category", "note", "date"]
+    table = [
+        {
+            "id": r["id"],
+            "type": r["type"],
+            "amount": float(r["amount"]),
+            "currency": r["currency"],
+            "category": r["category"],
+            "note": r["note"] or "",
+            "date": r["d"].strftime("%Y-%m-%d"),
+        }
+        for r in rows
+    ]
+
+    # serie giornaliere
+    by_day = { (d_from + dt.timedelta(days=i)).strftime("%Y-%m-%d"): {"in":0.0,"out":0.0} for i in range(30) }
+    for r in table:
+        k = r["date"]
+        if r["type"] == "in":
+            by_day[k]["in"] += r["amount"]
+        elif r["type"] == "out":
+            by_day[k]["out"] += r["amount"]
+    labels = sorted(by_day.keys())
+    series_in  = [ round(by_day[d]["in"], 2)  for d in labels ]
+    series_out = [ round(by_day[d]["out"], 2) for d in labels ]
+    series_net = [ round(i - o, 2) for i,o in zip(series_in, series_out) ]
+
+    total_in  = round(sum(series_in), 2)
+    total_out = round(sum(series_out), 2)
+    total_net = round(total_in - total_out, 2)
+
+    # 3) HTML super semplice + Chart.js
+    html = f"""
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>FLAI • Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <style>
+    :root {{ --bg:#0b0f16; --card:#141a24; --text:#e8eef9; --muted:#9db0cf; }}
+    body {{ margin:0; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu; }}
+    .wrap {{ max-width:1100px; margin:32px auto; padding:0 16px; }}
+    .cards {{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:20px; }}
+    .card {{ background:var(--card); border:1px solid #223049; border-radius:12px; padding:16px; }}
+    h1 {{ font-size:22px; margin:0 0 4px; }}
+    h2 {{ font-size:16px; margin:0 0 8px; color:var(--muted); font-weight:500; }}
+    table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid #223049; border-radius:12px; overflow:hidden; }}
+    th,td {{ padding:10px 12px; border-bottom:1px solid #223049; font-size:14px; }}
+    th {{ text-align:left; color:var(--muted); background:#101622; position:sticky; top:0; }}
+    .tag-in {{ color:#6fe3a6; }}
+    .tag-out {{ color:#ff8f8f; }}
+    .muted {{ color:var(--muted); }}
+    .chartbox {{ background:var(--card); border:1px solid #223049; border-radius:12px; padding:16px; margin:16px 0 24px; }}
+    .small {{ font-size:12px; color:var(--muted); }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>FLAI • Dashboard</h1>
+    <h2>Periodo: {d_from:%d/%m/%Y} → {d_to:%d/%m/%Y}</h2>
+
+    <div class="cards">
+      <div class="card"><div class="muted">Entrate</div><div style="font-size:22px;">{total_in:.2f} CHF</div></div>
+      <div class="card"><div class="muted">Uscite</div><div style="font-size:22px;">{total_out:.2f} CHF</div></div>
+      <div class="card"><div class="muted">Netto</div><div style="font-size:22px;">{total_net:.2f} CHF</div></div>
+    </div>
+
+    <div class="chartbox">
+      <canvas id="chart" height="100"></canvas>
+      <div class="small">In verde: entrate • In rosso: uscite • In azzurro: netto</div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>Data</th><th>Tipo</th><th>Importo</th><th>Valuta</th><th>Categoria</th><th>Note</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(f"<tr><td>{r['id']}</td><td>{r['date']}</td><td class='{'tag-in' if r['type']=='in' else 'tag-out'}'>{r['type']}</td><td>{r['amount']:.2f}</td><td>{r['currency']}</td><td>{r['category'] or ''}</td><td>{(r['note'] or '').replace('<','&lt;').replace('>','&gt;')}</td></tr>" for r in table)}
+      </tbody>
+    </table>
+
+    <p class="small" style="margin-top:12px">Ultimi 30 giorni. Aggiorna la pagina per i dati più recenti.</p>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script>
+    const labels = {_json.dumps(labels)};
+    const dataIn  = {_json.dumps(series_in)};
+    const dataOut = {_json.dumps(series_out)};
+    const dataNet = {_json.dumps(series_net)};
+
+    const ctx = document.getElementById('chart');
+    new Chart(ctx, {{
+      type: 'line',
+      data: {{
+        labels,
+        datasets: [
+          {{ label:'Entrate', data:dataIn, tension:0.25 }},
+          {{ label:'Uscite',  data:dataOut, tension:0.25 }},
+          {{ label:'Netto',   data:dataNet, tension:0.25 }}
+        ]
+      }},
+      options: {{
+        responsive:true,
+        plugins: {{
+          legend: {{ labels: {{ color:'#cfe0ff' }} }},
+        }},
+        scales: {{
+          x: {{ ticks: {{ color:'#9db0cf' }}, grid: {{ color:'#1b2638' }} }},
+          y: {{ ticks: {{ color:'#9db0cf' }}, grid: {{ color:'#1b2638' }} }}
+        }}
+      }}
+    }});
+  </script>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html, status_code=200)
+
