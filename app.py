@@ -8,6 +8,30 @@ import csv
 from fastapi.responses import StreamingResponse
 from fastapi.responses import Response
 
+# ==== DASHBOARD AUTH (HTTP Basic) ====
+import secrets
+from fastapi import Depends
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+security = HTTPBasic()
+
+def require_dashboard_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    user_ok = secrets.compare_digest(
+        credentials.username, os.getenv("DASHBOARD_USER", "admin")
+    )
+    pwd_ok = secrets.compare_digest(
+        credentials.password, os.getenv("DASHBOARD_PASSWORD", "")
+    )
+    if not (user_ok and pwd_ok):
+        # Questo fa apparire il popup del browser
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return True
+# =====================================
+
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, Request, Body, HTTPException, Query
@@ -33,44 +57,20 @@ APP.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Sicurezza + rate limit soft
-# -----------------------------------------------------------------------------
-WINDOW_SECONDS = 60
-MAX_REQ = 60
-_bucket = {}  # {key: (window_start_ts, count)}
-
-def _client_key(req: Request) -> str:
-    xf = req.headers.get("x-forwarded-for")
-    ip = xf.split(",")[0].strip() if xf else (req.client.host if req.client else "local")
-    ak = req.headers.get("x-api-key") or "-"
-    return f"{ip}|{ak}"
 
 @APP.middleware("http")
 async def security_and_rate_limit(request: Request, call_next):
+    # Whitelist: niente API key su healthz e dashboard (dashboard ha Basic Auth)
     path = request.url.path
+    if path.startswith("/healthz") or path.startswith("/dashboard"):
+        return await call_next(request)
 
-    # Endpoint aperti (NIENTE API key)
-    open_paths = {"/", "/healthz", "/webhook"}  # webhook sia GET sia POST
-    if path not in open_paths:
-        # API Key
-        if not API_KEY_APP:
-            return JSONResponse({"error": "server_misconfigured_no_api_key"}, status_code=500)
-        if request.headers.get("x-api-key") != API_KEY_APP:
-            raise HTTPException(status_code=401, detail="invalid api key")
+    # Tutto il resto richiede la chiave API
+    x_api_key = request.headers.get("X-API-Key")
+    if x_api_key != os.getenv("API_KEY_APP"):
+        raise HTTPException(status_code=401, detail="invalid api key")
 
-        # Rate limit soft per pod
-        now = int(time.time())
-        key = _client_key(request)
-        wstart, cnt = _bucket.get(key, (now, 0))
-        if now - wstart >= WINDOW_SECONDS:
-            wstart, cnt = now, 0
-        cnt += 1
-        _bucket[key] = (wstart, cnt)
-        if cnt > MAX_REQ:
-            return JSONResponse({"error": "rate_limited", "limit_per_min": MAX_REQ}, status_code=429)
-
-    resp = await call_next(request)
-    return resp
+    return await call_next(request)
 
 # -----------------------------------------------------------------------------
 # DB helpers
@@ -901,154 +901,57 @@ async def email_report(
 
 # ========== DASHBOARD WEB (lite) ==========
 from fastapi.responses import HTMLResponse
-import json as _json
-import datetime as dt
 
-@APP.get("/dashboard", response_class=HTMLResponse, summary="Dashboard web (ultimi 30 giorni)")
+@APP.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(require_dashboard_auth)])
 async def dashboard():
-    """
-    Mostra:
-      - tabella ultimi 30 giorni (movimenti)
-      - grafico giornaliero in/out/net
-      - totali periodo
-    """
-    d_to = dt.date.today()
-    d_from = d_to - dt.timedelta(days=29)
-
-    # 1) leggi movimenti dal DB
+    # HTML minimale (niente chiamate AJAX, così non servono header speciali)
+    # Se vuoi, puoi abbellirla dopo. Per ora mostra un riepilogo essenziale.
     with get_conn() as conn, conn.cursor() as c:
-        c.execute(
-            """
-            SELECT id, type, amount, currency, category, note, created_at::date AS d
+        c.execute("""
+            SELECT
+              to_char(created_at::date, 'YYYY-MM-DD') AS day,
+              SUM(CASE WHEN type='in'  THEN amount ELSE 0 END) AS in_total,
+              SUM(CASE WHEN type='out' THEN amount ELSE 0 END) AS out_total,
+              SUM(CASE WHEN type='in'  THEN amount ELSE 0 END) -
+              SUM(CASE WHEN type='out' THEN amount ELSE 0 END) AS net
             FROM movements
-            WHERE created_at::date BETWEEN %s AND %s
-            ORDER BY created_at DESC
-            """,
-            (d_from, d_to),
-        )
+            GROUP BY day
+            ORDER BY day DESC
+            LIMIT 14;
+        """)
         rows = c.fetchall()
 
-    # 2) prepara tabella + serie daily
-    cols = ["id", "type", "amount", "currency", "category", "note", "date"]
-    table = [
-        {
-            "id": r["id"],
-            "type": r["type"],
-            "amount": float(r["amount"]),
-            "currency": r["currency"],
-            "category": r["category"],
-            "note": r["note"] or "",
-            "date": r["d"].strftime("%Y-%m-%d"),
-        }
+    # tabella HTML semplice
+    head = "<tr><th>Giorno</th><th>Entrate</th><th>Uscite</th><th>Netto</th></tr>"
+    body = "\n".join(
+        f"<tr><td>{r['day']}</td><td>{r['in_total']:.2f}</td><td>{r['out_total']:.2f}</td><td>{r['net']:.2f}</td></tr>"
         for r in rows
-    ]
-
-    # serie giornaliere
-    by_day = { (d_from + dt.timedelta(days=i)).strftime("%Y-%m-%d"): {"in":0.0,"out":0.0} for i in range(30) }
-    for r in table:
-        k = r["date"]
-        if r["type"] == "in":
-            by_day[k]["in"] += r["amount"]
-        elif r["type"] == "out":
-            by_day[k]["out"] += r["amount"]
-    labels = sorted(by_day.keys())
-    series_in  = [ round(by_day[d]["in"], 2)  for d in labels ]
-    series_out = [ round(by_day[d]["out"], 2) for d in labels ]
-    series_net = [ round(i - o, 2) for i,o in zip(series_in, series_out) ]
-
-    total_in  = round(sum(series_in), 2)
-    total_out = round(sum(series_out), 2)
-    total_net = round(total_in - total_out, 2)
-
-    # 3) HTML super semplice + Chart.js
+    )
     html = f"""
-<!doctype html>
-<html lang="it">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>FLAI • Dashboard</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <style>
-    :root {{ --bg:#0b0f16; --card:#141a24; --text:#e8eef9; --muted:#9db0cf; }}
-    body {{ margin:0; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu; }}
-    .wrap {{ max-width:1100px; margin:32px auto; padding:0 16px; }}
-    .cards {{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:20px; }}
-    .card {{ background:var(--card); border:1px solid #223049; border-radius:12px; padding:16px; }}
-    h1 {{ font-size:22px; margin:0 0 4px; }}
-    h2 {{ font-size:16px; margin:0 0 8px; color:var(--muted); font-weight:500; }}
-    table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid #223049; border-radius:12px; overflow:hidden; }}
-    th,td {{ padding:10px 12px; border-bottom:1px solid #223049; font-size:14px; }}
-    th {{ text-align:left; color:var(--muted); background:#101622; position:sticky; top:0; }}
-    .tag-in {{ color:#6fe3a6; }}
-    .tag-out {{ color:#ff8f8f; }}
-    .muted {{ color:var(--muted); }}
-    .chartbox {{ background:var(--card); border:1px solid #223049; border-radius:12px; padding:16px; margin:16px 0 24px; }}
-    .small {{ font-size:12px; color:var(--muted); }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>FLAI • Dashboard</h1>
-    <h2>Periodo: {d_from:%d/%m/%Y} → {d_to:%d/%m/%Y}</h2>
-
-    <div class="cards">
-      <div class="card"><div class="muted">Entrate</div><div style="font-size:22px;">{total_in:.2f} CHF</div></div>
-      <div class="card"><div class="muted">Uscite</div><div style="font-size:22px;">{total_out:.2f} CHF</div></div>
-      <div class="card"><div class="muted">Netto</div><div style="font-size:22px;">{total_net:.2f} CHF</div></div>
-    </div>
-
-    <div class="chartbox">
-      <canvas id="chart" height="100"></canvas>
-      <div class="small">In verde: entrate • In rosso: uscite • In azzurro: netto</div>
-    </div>
-
-    <table>
-      <thead>
-        <tr>
-          <th>ID</th><th>Data</th><th>Tipo</th><th>Importo</th><th>Valuta</th><th>Categoria</th><th>Note</th>
-        </tr>
-      </thead>
-      <tbody>
-        {''.join(f"<tr><td>{r['id']}</td><td>{r['date']}</td><td class='{'tag-in' if r['type']=='in' else 'tag-out'}'>{r['type']}</td><td>{r['amount']:.2f}</td><td>{r['currency']}</td><td>{r['category'] or ''}</td><td>{(r['note'] or '').replace('<','&lt;').replace('>','&gt;')}</td></tr>" for r in table)}
-      </tbody>
-    </table>
-
-    <p class="small" style="margin-top:12px">Ultimi 30 giorni. Aggiorna la pagina per i dati più recenti.</p>
-  </div>
-
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script>
-    const labels = {_json.dumps(labels)};
-    const dataIn  = {_json.dumps(series_in)};
-    const dataOut = {_json.dumps(series_out)};
-    const dataNet = {_json.dumps(series_net)};
-
-    const ctx = document.getElementById('chart');
-    new Chart(ctx, {{
-      type: 'line',
-      data: {{
-        labels,
-        datasets: [
-          {{ label:'Entrate', data:dataIn, tension:0.25 }},
-          {{ label:'Uscite',  data:dataOut, tension:0.25 }},
-          {{ label:'Netto',   data:dataNet, tension:0.25 }}
-        ]
-      }},
-      options: {{
-        responsive:true,
-        plugins: {{
-          legend: {{ labels: {{ color:'#cfe0ff' }} }},
-        }},
-        scales: {{
-          x: {{ ticks: {{ color:'#9db0cf' }}, grid: {{ color:'#1b2638' }} }},
-          y: {{ ticks: {{ color:'#9db0cf' }}, grid: {{ color:'#1b2638' }} }}
-        }}
-      }}
-    }});
-  </script>
-</body>
-</html>
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8"/>
+        <title>FLAI • Dashboard</title>
+        <style>
+          body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 24px; }}
+          h1 {{ margin: 0 0 12px; }}
+          table {{ border-collapse: collapse; width: 100%; max-width: 900px; }}
+          th, td {{ border: 1px solid #ddd; padding: 8px 10px; text-align: right; }}
+          th:first-child, td:first-child {{ text-align: left; }}
+          th {{ background: #f6f6f6; }}
+        </style>
+      </head>
+      <body>
+        <h1>FLAI • Dashboard</h1>
+        <p>Riepilogo ultimi 14 giorni</p>
+        <table>
+          <thead>{head}</thead>
+          <tbody>{body}</tbody>
+        </table>
+        <p style="margin-top:18px;color:#666">Per uscire, chiudi il browser o cancella le credenziali salvate (Basic Auth).</p>
+      </body>
+    </html>
     """
     return HTMLResponse(content=html, status_code=200)
 
