@@ -712,67 +712,190 @@ async def report_pdf(
     except Exception as e:
         return {"error": "pdf_failed", "detail": str(e)}
 
-# =======================
-# EMAIL ENDPOINTS
-# =======================
-from fastapi import Request
+# === EMAIL: SENDER + REPORT PDF (definitivo) ==================================
+from typing import Optional, List, Tuple
+from pydantic import BaseModel, EmailStr
+from fastapi import Query, HTTPException
 import smtplib, ssl
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
-import os
+import io
+import datetime as dt
 
-SMTP_HOST = os.getenv("SMTP_HOST")
+# PDF (usiamo reportlab e testo nero esplicito)
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib.colors import black
+
+# === Config mail dalle ENV (già impostate su Render)
+SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-MAIL_FROM = os.getenv("MAIL_FROM")
-MAIL_TO = os.getenv("MAIL_TO")
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USERNAME or "noreply@example.com")
+MAIL_TO_DEFAULT = os.getenv("MAIL_TO", "")
 
+def _send_email(
+    to_addr: str,
+    subject: str,
+    body_text: str,
+    attachments: Optional[List[Tuple[str, bytes, str]]] = None,  # (filename, content, mimetype)
+) -> None:
+    if not (SMTP_HOST and SMTP_PORT and SMTP_USERNAME and SMTP_PASSWORD):
+        raise HTTPException(status_code=500, detail="smtp_not_configured")
 
-def send_email(subject: str, body: str, to: str, attachment: bytes = None, filename: str = None):
     msg = MIMEMultipart()
     msg["From"] = MAIL_FROM
-    msg["To"] = to
+    msg["To"] = to_addr
     msg["Subject"] = subject
+    msg.attach(MIMEText(body_text, "plain", "utf-8"))
 
-    # corpo
-    msg.attach(MIMEText(body, "plain"))
-
-    # allegato
-    if attachment and filename:
-        part = MIMEApplication(attachment, Name=filename)
-        part["Content-Disposition"] = f'attachment; filename="{filename}"'
+    for (fname, content, mimetype) in (attachments or []):
+        part = MIMEApplication(content, _subtype=(mimetype.split("/")[-1] if "/" in mimetype else "octet-stream"))
+        part.add_header("Content-Disposition", f'attachment; filename="{fname}"')
         msg.attach(part)
 
     context = ssl.create_default_context()
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls(context=context)
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.sendmail(MAIL_FROM, to, msg.as_string())
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        s.ehlo()
+        s.starttls(context=context)
+        s.login(SMTP_USERNAME, SMTP_PASSWORD)
+        s.send_message(msg)
 
+# --- utilità DB (riusa la tua get_conn esistente) -----------------------------
+def _fetch_movements_between(d_from: dt.date, d_to: dt.date, category: Optional[str]) -> List[dict]:
+    q = """
+        SELECT type, amount, currency, category, coalesce(note,'') as note, created_at
+        FROM movements
+        WHERE created_at::date BETWEEN %s AND %s
+    """
+    params: List = [d_from, d_to]
+    if category:
+        q += " AND category = %s"
+        params.append(category)
+    q += " ORDER BY created_at ASC, id ASC"
 
+    with get_conn() as conn, conn.cursor() as c:
+        c.execute(q, params)
+        rows = c.fetchall()
+
+    # rows è una lista di dict (row_factory=dict_row nel tuo get_conn)
+    return rows
+
+def _make_pdf_report_bytes(
+    d_from: dt.date,
+    d_to: dt.date,
+    category: Optional[str],
+) -> bytes:
+    """
+    PDF minimale ma leggibile: intestazione, totali, e tabellina movimenti.
+    """
+    movements = _fetch_movements_between(d_from, d_to, category)
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    margin = 15 * mm
+    x = margin
+    y = height - margin
+
+    # Header
+    c.setFillColor(black)
+    c.setFont("Helvetica-Bold", 16)
+    title = "FLAI – Report movimenti"
+    if category:
+        title += f" (categoria: {category})"
+    c.drawString(x, y, title); y -= 10 * mm
+
+    c.setFont("Helvetica", 11)
+    c.drawString(x, y, f"Periodo: {d_from.isoformat()} → {d_to.isoformat()}"); y -= 7 * mm
+
+    # Totali
+    tot_in = sum(r["amount"] for r in movements if r["type"] == "in")
+    tot_out = sum(r["amount"] for r in movements if r["type"] == "out")
+    tot_net = tot_in - tot_out
+    cur = movements[0]["currency"] if movements else "CHF"
+    c.drawString(x, y, f"Totale entrate: {tot_in:.2f} {cur}   •   Totale uscite: {tot_out:.2f} {cur}   •   Netto: {tot_net:.2f} {cur}")
+    y -= 10 * mm
+
+    # Tabella
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(x, y, "Data")
+    c.drawString(x + 28*mm, y, "Tipo")
+    c.drawString(x + 45*mm, y, "Importo")
+    c.drawString(x + 75*mm, y, "Cat.")
+    c.drawString(x + 105*mm, y, "Nota")
+    y -= 5 * mm
+    c.setFont("Helvetica", 10)
+
+    rows_per_page = int((y - margin) // (5.5 * mm))
+    i = 0
+    for r in movements:
+        if i and i % rows_per_page == 0:
+            c.showPage()
+            c.setFillColor(black); c.setFont("Helvetica", 10)
+            y = height - margin
+        date_s = r["created_at"].strftime("%Y-%m-%d")
+        c.drawString(x, y, date_s)
+        c.drawString(x + 28*mm, y, "Entrata" if r["type"] == "in" else "Uscita")
+        c.drawRightString(x + 72*mm, y, f'{r["amount"]:.2f} {r["currency"]}')
+        c.drawString(x + 75*mm, y, (r["category"] or "")[:18])
+        c.drawString(x + 105*mm, y, (r["note"] or "")[:40])
+        y -= 5.5 * mm
+        i += 1
+
+    if not movements:
+        c.drawString(x, y, "Nessun movimento nel periodo selezionato.")
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+# ---------- Schemi richieste ----------
+class EmailTestPayload(BaseModel):
+    to: EmailStr
+    subject: str
+    body: str
+
+class ReportEmailPayload(BaseModel):
+    to: Optional[EmailStr] = None  # se mancante usa MAIL_TO_DEFAULT
+
+# ---------- Endpoint: email di prova (solo testo) ----------
 @APP.post("/email/test")
-async def send_test_email():
-    send_email(
-        subject="FLAI - Test email semplice",
-        body="Ciao! Questa è una prova inviata da FLAI.",
-        to=MAIL_TO
-    )
-    return {"ok": True, "message": "Email di test inviata"}
+async def email_test(payload: EmailTestPayload):
+    _send_email(payload.to, payload.subject, payload.body)
+    return {"ok": True, "to": payload.to, "subject": payload.subject}
 
-
+# ---------- Endpoint: email con PDF (parametri OBBLIGATORI) ----------
 @APP.post("/email/report")
-async def send_report_email(from_date: str = None, to_date: str = None):
-    # qui puoi riusare la tua logica PDF (se esiste già la funzione export PDF)
-    pdf_content = b"%PDF-1.4\n%Test PDF\n"  # <- per test, un pdf finto
-    send_email(
-        subject=f"FLAI - Report PDF ({from_date} → {to_date})",
-        body="In allegato trovi il PDF dei movimenti.",
-        to=MAIL_TO,
-        attachment=pdf_content,
-        filename="report.pdf"
-    )
-    return {"ok": True, "message": "Email con PDF inviata"}
+async def email_report(
+    payload: ReportEmailPayload,
+    from_date: dt.date = Query(..., alias="from"),
+    to_date: dt.date = Query(..., alias="to"),
+    category: Optional[str] = None,
+):
+    """
+    Invia un PDF con il report del periodo. Se from/to mancano → 422 (automatico).
+    """
+    to_addr = (payload.to or MAIL_TO_DEFAULT or SMTP_USERNAME)
+    if not to_addr:
+        raise HTTPException(status_code=400, detail="missing_to_address")
+
+    pdf_bytes = _make_pdf_report_bytes(from_date, to_date, category)
+    fname = f"flai-report_{from_date.isoformat()}_{to_date.isoformat()}"
+    if category:
+        fname += f"_{category}"
+    fname += ".pdf"
+
+    subject = f"FLAI – Report PDF ({from_date} → {to_date})"
+    if category:
+        subject += f" – {category}"
+
+    body = "In allegato trovi il PDF dei movimenti."
+    _send_email(to_addr, subject, body, attachments=[(fname, pdf_bytes, "application/pdf")])
+    return {"ok": True, "to": to_addr, "filename": fname, "bytes": len(pdf_bytes)}
+# === FINE EMAIL ===============================================================
 
 
