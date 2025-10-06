@@ -901,376 +901,131 @@ async def email_report(
 # ============================================================
 # DASHBOARD (HTML + API dati) — filtri, tabella, grafico, export
 # ============================================================
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-import json
-import io
-from datetime import date as _date
-
-def _iso_or_none(s: str | None):
-    try:
-        return dt.date.fromisoformat(s) if s else None
-    except Exception:
-        return None
-
-def _like(s: str | None):
-    return f"%{s.strip()}%" if s and s.strip() else None
-
-def _fetch_dashboard_rows(conn, d_from, d_to, typ, category, q, limit=500):
-    qsql = """
-      SELECT id, type, amount::numeric(14,2), currency, category, coalesce(note,''), created_at
-      FROM movements
-      WHERE 1=1
-    """
-    params = []
-    if d_from:
-        qsql += " AND created_at::date >= %s"
-        params.append(d_from)
-    if d_to:
-        qsql += " AND created_at::date <= %s"
-        params.append(d_to)
-    if typ in ("in","out"):
-        qsql += " AND type = %s"
-        params.append(typ)
-    if category:
-        qsql += " AND category = %s"
-        params.append(category)
-    if q:
-        qsql += " AND (note ILIKE %s)"
-        params.append(_like(q))
-    qsql += " ORDER BY created_at DESC LIMIT %s"
-    params.append(limit)
-
-    with conn.cursor() as c:
-        c.execute(qsql, params)
-        rows = c.fetchall()
-    # rows: [(id, type, amount, currency, category, note, created_at), ...]
-    return [
-        {
-            "id": r[0],
-            "type": r[1],
-            "amount": float(r[2]),
-            "currency": r[3],
-            "category": r[4],
-            "note": r[5],
-            "created_at": r[6].isoformat()
-        }
-        for r in rows
-    ]
-
-def _totals_from_rows(rows):
-    tot_in = sum(r["amount"] for r in rows if r["type"] == "in")
-    tot_out = sum(r["amount"] for r in rows if r["type"] == "out")
-    return {
-        "in": round(tot_in,2),
-        "out": round(tot_out,2),
-        "net": round(tot_in - tot_out,2)
-    }
-
-def _daily_series(rows):
-    # somma per giorno
-    by_day = {}
-    for r in rows:
-        d = r["created_at"][:10]  # YYYY-MM-DD
-        s = by_day.setdefault(d, {"in":0.0,"out":0.0})
-        s[r["type"]] += r["amount"]
-    # in ordine di data
-    days = sorted(by_day.keys())
-    return {
-        "labels": days,
-        "in": [ round(by_day[d]["in"],2) for d in days ],
-        "out":[ round(by_day[d]["out"],2) for d in days ],
-        "net":[ round(by_day[d]["in"]-by_day[d]["out"],2) for d in days ]
-    }
-
-def _category_breakdown(rows):
-    by_cat = {}
-    for r in rows:
-        cat = r["category"] or "-"
-        by_cat.setdefault(cat, 0.0)
-        by_cat[cat] += (r["amount"] if r["type"]=="in" else -r["amount"])
-    # lista ordinata per valore assoluto
-    cats = sorted(by_cat.items(), key=lambda kv: abs(kv[1]), reverse=True)
-    return [{"category":k, "net": round(v,2)} for k,v in cats]
-
-@APP.get("/dashboard/data", response_class=JSONResponse)
-async def dashboard_data(
-    request: Request,
-    frm: str | None = Query(None, alias="from"),
-    to:  str | None = None,
-    typ: str | None = None,          # "in" | "out" | None
-    category: str | None = None,
-    q: str | None = None,
-    limit: int = 500
-):
-    # NOTA: questo endpoint è chiamato dalla pagina HTML via fetch()
-    d_from = _iso_or_none(frm)
-    d_to   = _iso_or_none(to)
-    typ    = typ if typ in ("in","out") else None
-    with get_conn() as conn:
-        rows = _fetch_dashboard_rows(conn, d_from, d_to, typ, category, q, min(limit,2000))
-        totals = _totals_from_rows(rows)
-        series = _daily_series(rows)
-        cats   = _category_breakdown(rows)
-    return {"ok": True, "totals": totals, "series": series, "rows": rows, "categories": cats}
-
-@APP.get("/dashboard/download")
-async def dashboard_download_pdf(
-    request: Request,
-    frm: str | None = Query(None, alias="from"),
-    to:  str | None = None,
-    category: str | None = None
-):
-    """
-    Reindirizza all'endpoint già esistente che genera il PDF.
-    Se non passi parametri, prende la settimana corrente.
-    """
-    params = []
-    if frm: params.append(("from", frm))
-    if to:  params.append(("to", to))
-    if category: params.append(("category", category))
-    # costruisco URL del pdf interno
-    base = str(request.base_url).rstrip("/")
-    qs = "&".join([f"{k}={v}" for k,v in params]) if params else ""
-    url = f"{base}/reports/pdf"
-    if qs:
-        url += f"?{qs}"
-    # stream del PDF
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-        r = await client.get(url, headers={"X-API-Key": API_KEY_APP})
-        r.raise_for_status()
-        return StreamingResponse(io.BytesIO(r.content), media_type="application/pdf",
-                                 headers={"Content-Disposition":"attachment; filename=flai_report.pdf"})
-
-@APP.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(
-    request: Request,
-    frm: str | None = Query(None, alias="from"),
-    to:  str | None = None,
-    typ: str | None = None,
-    category: str | None = None,
-    q: str | None = None
-):
-    """
-    Pagina HTML con:
-    - filtri (date/type/categoria/ricerca)
-    - totali
-    - grafico (Chart.js via CDN)
-    - tabella
-    - pulsanti export (CSV/PDF)
-    """
-    # valori di default (ultimo mese)
-    today = _date.today()
-    default_from = (today.replace(day=1)).isoformat()
-    frm = frm or default_from
-    to = to or today.isoformat()
-    typ = typ or ""
-    category = category or ""
-    q = q or ""
-    html = f"""
-<!doctype html>
+@APP.get("/dashboard")
+async def dashboard(request: Request) -> HTMLResponse:
+    html = f"""<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>FLAI — Dashboard</title>
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <title>FLAI · Dashboard</title>
   <style>
-    :root {{
-      --bg:#0b0f14; --panel:#121821; --muted:#7f8ea3; --text:#e7eef7; --accent:#4cc9f0; --accent2:#f72585; --ok:#66d46e; --bad:#ff6b6b;
-    }}
-    html,body {{ margin:0; background:var(--bg); color:var(--text); font-family:Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }}
-    .wrap {{ max-width:1100px; margin:0 auto; padding:28px 16px 64px; }}
-    h1 {{ font-size:22px; margin:0 0 18px; letter-spacing:.2px; }}
-    .card {{ background:var(--panel); border:1px solid #1e2a39; border-radius:12px; padding:16px; }}
-    .grid {{ display:grid; grid-template-columns:1fr; gap:16px; }}
-    @media(min-width:900px){{ .grid {{ grid-template-columns: 1.2fr .8fr; }} }}
-    label {{ font-size:12px; color:var(--muted); display:block; margin-bottom:4px; }}
-    input, select {{ width:100%; background:#0e141c; border:1px solid #223246; color:var(--text); border-radius:8px; padding:10px 12px; }}
-    .row {{ display:grid; grid-template-columns: repeat(6,1fr); gap:10px; }}
-    .row .grow {{ grid-column: span 2; }}
-    .btn {{ background:var(--accent); color:#041421; border:none; padding:10px 14px; border-radius:10px; font-weight:600; cursor:pointer; }}
-    .btn.secondary {{ background:#1f2a3a; color:var(--text); border:1px solid #2a3b52; }}
-    .kpis {{ display:grid; grid-template-columns: repeat(3,1fr); gap:10px; margin-top:14px; }}
-    .kpi {{ background:#0e141c; border:1px solid #1f2a3a; border-radius:10px; padding:12px; }}
-    .kpi .v {{ font-size:20px; font-weight:700; }}
-    .kpi .in {{ color:var(--ok) }} .kpi .out {{ color:var(--bad) }} .kpi .net {{ color:var(--accent) }}
-    table {{ width:100%; border-collapse:collapse; margin-top:12px; font-size:14px; }}
-    th, td {{ padding:10px 8px; border-bottom:1px solid #1e2a39; }}
-    th {{ text-align:left; color:var(--muted); font-weight:600; }}
-    .tag {{ font-size:12px; padding:2px 8px; border-radius:999px; border:1px solid #2a3b52; background:#0e141c; color:#b9c6d8; }}
-    .type-in {{ color:var(--ok); font-weight:700; }}
-    .type-out {{ color:var(--bad); font-weight:700; }}
-    .topbar {{ display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; }}
+    :root {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }}
+    body {{ margin: 0; background:#0b0c0f; color:#e6e6e6; }}
+    header {{ padding:16px 20px; border-bottom:1px solid #222; display:flex; gap:12px; align-items:center; }}
+    input, select, button {{ background:#121418; color:#e6e6e6; border:1px solid #2a2d34; border-radius:8px; padding:8px 10px; }}
+    button {{ cursor:pointer; }}
+    main {{ padding:20px; max-width:1100px; margin:0 auto; }}
+    .row {{ display:flex; gap:12px; flex-wrap:wrap; }}
+    .card {{ background:#0f1116; border:1px solid #1e222a; border-radius:12px; padding:16px; }}
+    table {{ width:100%; border-collapse:collapse; }}
+    th, td {{ padding:10px; border-bottom:1px solid #1c1f26; text-align:left; }}
+    th {{ color:#9aa4b2; font-weight:600; }}
+    .kpi {{ display:flex; gap:16px; }}
+    .kpi .card {{ flex:1; }}
+    .muted {{ color:#9aa4b2; }}
+    a.btn {{ text-decoration:none; }}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>FLAI — Dashboard</h1>
+  <header>
+    <strong>FLAI · Dashboard</strong>
+    <input type="date" id="from" />
+    <input type="date" id="to" />
+    <select id="category">
+      <option value="">tutte le categorie</option>
+      <option value="sales">sales</option>
+      <option value="fornitori">fornitori</option>
+      <option value="test">test</option>
+    </select>
+    <button id="apply">Applica filtri</button>
+    <a id="download" class="btn" href="#" target="_blank">Scarica PDF</a>
+  </header>
 
-    <div class="card">
-      <div class="topbar">
-        <div>
-          <label>Dal (YYYY-MM-DD)</label>
-          <input id="f_from" value="{frm}" placeholder="2025-09-01">
-        </div>
-        <div>
-          <label>Al (YYYY-MM-DD)</label>
-          <input id="f_to" value="{to}" placeholder="{to}">
-        </div>
-        <div>
-          <label>Tipo</label>
-          <select id="f_typ">
-            <option value="" {"selected" if not typ else ""}>Tutti</option>
-            <option value="in"  {"selected" if typ=="in" else ""}>Entrate</option>
-            <option value="out" {"selected" if typ=="out" else ""}>Uscite</option>
-          </select>
-        </div>
-        <div>
-          <label>Categoria</label>
-          <input id="f_cat" value="{category or ""}" placeholder="es. sales, fornitori">
-        </div>
-        <div class="grow">
-          <label>Ricerca nota</label>
-          <input id="f_q" value="{q or ""}" placeholder='es. "cliente giuseppe"'>
-        </div>
-        <div>
-          <button class="btn" id="btn_apply">Applica</button>
-        </div>
-        <div>
-          <button class="btn secondary" id="btn_pdf">Scarica PDF</button>
-        </div>
-      </div>
+  <main>
+    <section class="kpi">
+      <div class="card"><div class="muted">Entrate</div><div id="kpi-in" style="font-size:22px;">–</div></div>
+      <div class="card"><div class="muted">Uscite</div><div id="kpi-out" style="font-size:22px;">–</div></div>
+      <div class="card"><div class="muted">Netto</div><div id="kpi-net" style="font-size:22px;">–</div></div>
+    </section>
 
-      <div class="kpis">
-        <div class="kpi"><div>Entrate</div><div class="v in" id="k_in">–</div></div>
-        <div class="kpi"><div>Uscite</div><div class="v out" id="k_out">–</div></div>
-        <div class="kpi"><div>Netto</div><div class="v net" id="k_net">–</div></div>
-      </div>
-    </div>
+    <section class="card" style="margin-top:16px;">
+      <canvas id="chart" height="110"></canvas>
+    </section>
 
-    <div class="grid" style="margin-top:16px;">
-      <div class="card">
-        <canvas id="chart" height="120"></canvas>
-      </div>
-      <div class="card">
-        <h3 style="margin:0 0 10px; font-size:16px;">Categorie (Netto)</h3>
-        <div id="cats"></div>
-      </div>
-    </div>
-
-    <div class="card" style="margin-top:16px;">
+    <section class="card" style="margin-top:16px;">
+      <div class="muted" style="margin-bottom:8px;">Movimenti</div>
       <table id="tbl">
-        <thead>
-          <tr>
-            <th>ID</th><th>Data</th><th>Tipo</th><th>Importo</th><th>Valuta</th><th>Categoria</th><th>Nota</th>
-          </tr>
-        </thead>
+        <thead><tr><th>id</th><th>tipo</th><th>amount</th><th>currency</th><th>category</th><th>note</th><th>created_at</th></tr></thead>
         <tbody></tbody>
       </table>
-    </div>
-  </div>
+    </section>
+  </main>
 
-<script>
-const fmt = n => new Intl.NumberFormat('it-CH', {{style:'currency', currency:'CHF'}}).format(n || 0);
+  <script>
+  // Helpers querystring
+  const qs = new URLSearchParams(window.location.search);
+  const $ = (id) => document.getElementById(id);
 
-let chart;
+  // Pre-popola filtri
+  if (qs.get('from')) $('from').value = qs.get('from');
+  if (qs.get('to')) $('to').value = qs.get('to');
+  if (qs.get('category')) $('category').value = qs.get('category');
 
-function renderChart(labels, dataIn, dataOut, dataNet) {{
-  const ctx = document.getElementById('chart').getContext('2d');
-  if (chart) chart.destroy();
-  chart = new Chart(ctx, {{
-    type: 'line',
-    data: {{
-      labels,
-      datasets: [
-        {{ label:'Entrate', data:dataIn, tension:.25 }},
-        {{ label:'Uscite',  data:dataOut, tension:.25 }},
-        {{ label:'Netto',   data:dataNet, tension:.25 }}
-      ]
-    }},
-    options: {{
-      plugins: {{
-        legend: {{ labels: {{ color:'#b9c6d8' }} }}
-      }},
-      scales: {{
-        x: {{ ticks: {{ color:'#9fb0c7' }} }},
-        y: {{ ticks: {{ color:'#9fb0c7' }} }}
-      }}
+  function buildQuery() {{
+    const p = new URLSearchParams();
+    if ($('from').value) p.set('from', $('from').value);
+    if ($('to').value) p.set('to', $('to').value);
+    if ($('category').value) p.set('category', $('category').value);
+    return p.toString();
+  }}
+
+  async function loadData() {{
+    const q = buildQuery();
+    const resp = await fetch('/dashboard/data' + (q ? '?' + q : ''));
+    if (!resp.ok) {{
+      console.error('HTTP', resp.status);
+      return;
     }}
-  }});
-}}
+    const data = await resp.json();
 
-function rowHtml(r){{
-  const typ = r.type === 'in' ? '<span class="type-in">IN</span>' : '<span class="type-out">OUT</span>';
-  return `<tr>
-    <td>${{r.id}}</td>
-    <td>${{r.created_at.slice(0,19).replace('T',' ')}}</td>
-    <td>${{typ}}</td>
-    <td>${{fmt(r.amount)}}</td>
-    <td>${{r.currency}}</td>
-    <td><span class="tag">${{r.category||'-'}}</span></td>
-    <td>${{(r.note||'').replace(/</g,'&lt;')}}</td>
-  </tr>`;
-}}
+    // KPI
+    $('kpi-in').textContent  = (data.kpi.in  ?? 0).toFixed(2);
+    $('kpi-out').textContent = (data.kpi.out ?? 0).toFixed(2);
+    $('kpi-net').textContent = (data.kpi.net ?? 0).toFixed(2);
 
-async function loadData(){{
-  const params = new URLSearchParams();
-  const v_from = document.getElementById('f_from').value.trim();
-  const v_to   = document.getElementById('f_to').value.trim();
-  const v_typ  = document.getElementById('f_typ').value;
-  const v_cat  = document.getElementById('f_cat').value.trim();
-  const v_q    = document.getElementById('f_q').value.trim();
-  if(v_from) params.set('from', v_from);
-  if(v_to)   params.set('to', v_to);
-  if(v_typ)  params.set('typ', v_typ);
-  if(v_cat)  params.set('category', v_cat);
-  if(v_q)    params.set('q', v_q);
-  params.set('limit','1000');
+    // Tabella
+    const tb = $('tbl').querySelector('tbody');
+    tb.innerHTML = '';
+    for (const r of data.rows) {{
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${{r.id}}</td>
+        <td>${{r.type}}</td>
+        <td>${{r.amount.toFixed(2)}}</td>
+        <td>${{r.currency}}</td>
+        <td>${{r.category ?? ''}}</td>
+        <td>${{r.note ?? ''}}</td>
+        <td>${{r.created_at}}</td>`;
+      tb.appendChild(tr);
+    }}
 
-  const resp = await fetch('/dashboard/data?'+params.toString(), {{headers:{{'X-Requested-With':'fetch'}}}});
-  const data = await resp.json();
+    // Link download PDF
+    const pdfQ = new URLSearchParams(q);
+    $('download').href = '/dashboard/download' + (pdfQ.toString() ? '?' + pdfQ.toString() : '');
+  }}
 
-  document.getElementById('k_in').innerText  = fmt(data.totals.in);
-  document.getElementById('k_out').innerText = fmt(data.totals.out);
-  document.getElementById('k_net').innerText = fmt(data.totals.net);
-
-  renderChart(data.series.labels, data.series.in, data.series.out, data.series.net);
-
-  const cats = document.getElementById('cats');
-  cats.innerHTML = '';
-  data.categories.slice(0,12).forEach(c => {{
-    const sign = c.net >= 0 ? '+' : '';
-    const el = document.createElement('div');
-    el.style.marginBottom = '6px';
-    el.innerHTML = `<span class="tag">${{c.category}}</span> &nbsp; <b>${{sign + fmt(c.net)}}</b>`;
-    cats.appendChild(el);
+  $('apply').addEventListener('click', () => {{
+    const q = buildQuery();
+    const url = new URL(window.location.href);
+    url.search = q;
+    history.replaceState(null, '', url);
+    loadData();
   }});
 
-  const tb = document.querySelector('#tbl tbody');
-  tb.innerHTML = data.rows.map(rowHtml).join('');
-}}
-
-document.getElementById('btn_apply').addEventListener('click', loadData);
-document.getElementById('btn_pdf').addEventListener('click', ()=>{
-  const params = new URLSearchParams();
-  const v_from = document.getElementById('f_from').value.trim();
-  const v_to   = document.getElementById('f_to').value.trim();
-  const v_cat  = document.getElementById('f_cat').value.trim();
-  if(v_from) params.set('from', v_from);
-  if(v_to)   params.set('to', v_to);
-  if(v_cat)  params.set('category', v_cat);
-  const url = '/dashboard/download'+(params.toString()?('?'+params.toString()):'');
-  window.open(url, '_blank');
-});
-
-loadData();
-</script>
+  loadData();
+  </script>
 </body>
 </html>
-    """
+"""
     return HTMLResponse(html)
-# =======================
-# END DASHBOARD
-# =======================
