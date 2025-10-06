@@ -900,14 +900,15 @@ async def email_report(
 
 
 # ======================================================================
-# DASHBOARD (HTML + API dati) – filtri, tabella, grafico, export
+# DASHBOARD (HTML + API dati) – filtri, tabella, export PDF
 # ======================================================================
 
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Query
+import datetime as dt
 
 def _iso_or_none(s: str | None):
     try:
-        import datetime as dt
         return dt.date.fromisoformat(s) if s else None
     except Exception:
         return None
@@ -916,8 +917,16 @@ def _like(s: str | None):
     return f"%{s.strip()}%" if s and s.strip() else None
 
 def _fetch_dashboard_rows(conn, d_from, d_to, typ, category, q, limit=500):
+    # NB: alias espliciti per avere chiavi pulite col row_factory=dict_row
     qsql = """
-        SELECT id, type, amount::numeric(14,2), currency, category, coalesce(note,''), created_at
+        SELECT
+            id,
+            type,
+            amount::numeric(14,2) AS amount,
+            currency,
+            category,
+            COALESCE(note,'')     AS note,
+            created_at
         FROM movements
         WHERE 1=1
     """
@@ -936,22 +945,24 @@ def _fetch_dashboard_rows(conn, d_from, d_to, typ, category, q, limit=500):
         params.append(category)
     if q:
         qsql += " AND (note ILIKE %s OR category ILIKE %s)"
-        params += [_like(q), _like(q)]
+        like = _like(q)
+        params += [like, like]
+
     qsql += " ORDER BY created_at DESC LIMIT %s"
     params.append(limit)
 
     rows = []
     with conn.cursor() as c:
         c.execute(qsql, params)
-        for r in c.fetchall():
+        for r in c.fetchall():  # r è un dict grazie a row_factory=dict_row
             rows.append({
-                "id": r[0],
-                "type": r[1],
-                "amount": float(r[2]),
-                "currency": r[3],
-                "category": r[4],
-                "note": r[5],
-                "created_at": r[6].isoformat()
+                "id": r["id"],
+                "type": r["type"],
+                "amount": float(r["amount"]),
+                "currency": r["currency"],
+                "category": r["category"],
+                "note": r["note"],
+                "created_at": r["created_at"].isoformat()
             })
     return rows
 
@@ -967,159 +978,142 @@ async def dashboard_data(
     d_from = _iso_or_none(from_)
     d_to   = _iso_or_none(to)
     typ    = type if type in ("in","out") else None
+
     with get_conn() as conn:
         rows = _fetch_dashboard_rows(conn, d_from, d_to, typ, category, q)
-    # totali
-    total_in  = sum(r["amount"] for r in rows if r["type"]=="in")
-    total_out = sum(r["amount"] for r in rows if r["type"]=="out")
+
+    total_in  = sum(r["amount"] for r in rows if r["type"] == "in")
+    total_out = sum(r["amount"] for r in rows if r["type"] == "out")
+
     return JSONResponse({
         "ok": True,
-        "totals": {"in": total_in, "out": total_out, "net": total_in-total_out},
+        "totals": {"in": total_in, "out": total_out, "net": total_in - total_out},
         "rows": rows,
         "count": len(rows)
     })
 
 @APP.get("/dashboard")
 async def dashboard(request: Request) -> HTMLResponse:
-    html = f"""<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html lang="it">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>FLAI · Dashboard</title>
-  <style>
-    :root {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }}
-    body {{ margin:0; background:#0b0e0f; color:#e6e6e6; }}
-    header {{ padding:12px 20px; border-bottom:1px solid #0f1a22; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
-    .brand {{ font-weight:700; letter-spacing:.3px; }}
-    .bar {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
-    input, select, button {{ background:#121a1f; color:#e6e6e6; border:1px solid #223d34; border-radius:8px; padding:8px 10px; }}
-    button.btn {{ background:#0e4a6c; border-color:#0e4a6c; cursor:pointer; }}
-    button.btn:hover {{ filter:brightness(1.1); }}
-    main {{ padding:18px; max-width:1100px; margin-inline:auto; }}
-    .kpis {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    .card {{ background:#121a1f; border:1px solid #223d34; border-radius:12px; padding:14px; flex:1; min-width:220px; }}
-    .muted {{ color:#97a4ab; font-size:.9rem; }}
-    table {{ width:100%; border-collapse:collapse; margin-top:14px; }}
-    th,td {{ padding:10px; border-bottom:1px solid #1b262c; font-size:.95rem; }}
-    tr:hover td {{ background:#10181d; }}
-    .right {{ text-align:right; }}
-    .search {{ flex:1; min-width:180px; }}
-    a {{ color:#85bfe6; text-decoration:none; }}
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FLAI · Dashboard</title>
+<style>
+  :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  body  { margin:0; background:#0b0e0f; color:#e6e6e6; }
+  header{ padding:12px 20px; border-bottom:1px solid #0f1a22; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .brand{ font-weight:700; letter-spacing:.3px; }
+  .bar   { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input, select, button { background:#121a1f; color:#e6e6e6; border:1px solid #223d34; border-radius:8px; padding:8px 10px; }
+  button.btn { background:#0e4a6c; border-color:#0e4a6c; cursor:pointer; }
+  button.btn:hover { filter:brightness(1.1); }
+  main  { padding:18px; max-width:1100px; margin-inline:auto; }
+  .kpis { display:flex; gap:12px; flex-wrap:wrap; }
+  .card { background:#121a1f; border:1px solid #223d34; border-radius:12px; padding:14px; flex:1; min-width:220px; }
+  .muted{ color:#97a4ab; font-size:.9rem; }
+  table { width:100%; border-collapse:collapse; margin-top:14px; }
+  th,td { padding:10px; border-bottom:1px solid #1b262c; font-size:.95rem; }
+  tr:hover td { background:#10181d; }
+  .right{ text-align:right; }
+  .search{ flex:1; min-width:180px; }
+  a { color:#85bfe6; text-decoration:none; }
+</style>
 </head>
 <body>
-  <header>
-    <div class="brand">FLAI · Dashboard</div>
-    <div class="bar">
-      <label>Dal <input id="from" type="date"></label>
-      <label>Al <input id="to" type="date"></label>
-      <select id="type">
-        <option value="">tutti i tipi</option>
-        <option value="in">entrate</option>
-        <option value="out">uscite</option>
-      </select>
-      <input id="category" placeholder="categoria (es. sales, fornitori)" />
-      <input id="q" class="search" placeholder="cerca testo (note, categoria)"/>
-      <button id="apply" class="btn">Applica filtri</button>
-      <button id="pdf" class="btn">Scarica PDF</button>
-    </div>
-  </header>
-  <main>
-    <div class="kpis">
-      <div class="card"><div class="muted">Entrate</div><div id="k_in" style="font-size:1.3rem;margin-top:6px">–</div></div>
-      <div class="card"><div class="muted">Uscite</div><div id="k_out" style="font-size:1.3rem;margin-top:6px">–</div></div>
-      <div class="card"><div class="muted">Netto</div><div id="k_net" style="font-size:1.3rem;margin-top:6px">–</div></div>
-    </div>
+<header>
+  <div class="brand">FLAI · Dashboard</div>
+  <div class="bar">
+    <label>Dal <input id="from" type="date"></label>
+    <label>Al <input id="to" type="date"></label>
+    <select id="type">
+      <option value="">tutti i tipi</option>
+      <option value="in">entrate</option>
+      <option value="out">uscite</option>
+    </select>
+    <input id="category" placeholder="categoria (es. sales, fornitori)" />
+    <input id="q" class="search" placeholder="cerca testo (note, categoria)"/>
+    <button id="apply" class="btn">Applica filtri</button>
+    <button id="pdf" class="btn">Scarica PDF</button>
+  </div>
+</header>
+<main>
+  <div class="kpis">
+    <div class="card"><div class="muted">Entrate</div><div id="k_in"  style="font-size:1.3rem;margin-top:6px">–</div></div>
+    <div class="card"><div class="muted">Uscite</div><div id="k_out" style="font-size:1.3rem;margin-top:6px">–</div></div>
+    <div class="card"><div class="muted">Netto</div><div id="k_net" style="font-size:1.3rem;margin-top:6px">–</div></div>
+  </div>
 
-    <div class="card" style="margin-top:14px;">
-      <div class="muted" style="margin-bottom:8px;">Movimenti</div>
-      <table id="tbl">
-        <thead>
-          <tr>
-            <th>id</th><th>tipo</th><th class="right">amount</th><th>currency</th><th>category</th><th>note</th><th>created_at</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-      <div id="empty" class="muted" style="display:none;margin-top:8px;">Nessun movimento per i filtri selezionati.</div>
-    </div>
-  </main>
+  <div class="card" style="margin-top:14px;">
+    <div class="muted" style="margin-bottom:8px;">Movimenti</div>
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th>id</th><th>tipo</th><th class="right">amount</th><th>currency</th><th>category</th><th>note</th><th>created_at</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div id="empty" class="muted" style="display:none;margin-top:8px;">Nessun movimento per i filtri selezionati.</div>
+  </div>
+</main>
 
 <script>
-function fmt(n) {{
-  try {{ return new Intl.NumberFormat('it-CH', {{minimumFractionDigits:2, maximumFractionDigits:2}}).format(n); }}
-  catch(e) {{ return n; }}
-}}
-function todayISO(d) {{
-  const z = (n)=> String(n).padStart(2,'0');
-  return d.getFullYear() + '-' + z(d.getMonth()+1) + '-' + z(d.getDate());
-}}
-function setDefaults() {{
-  const to = new Date();
-  const from = new Date(); from.setMonth(from.getMonth()-1);
-  document.getElementById('from').value = todayISO(from);
-  document.getElementById('to').value = todayISO(to);
-}}
-async function loadData() {{
+function fmt(n){ try { return new Intl.NumberFormat('it-CH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n);}catch(e){return n;}}
+function todayISO(d){ const z=n=>String(n).padStart(2,'0'); return d.getFullYear()+'-'+z(d.getMonth()+1)+'-'+z(d.getDate()); }
+function setDefaults(){
+  const to=new Date(); const from=new Date(); from.setMonth(from.getMonth()-1);
+  document.getElementById('from').value=todayISO(from);
+  document.getElementById('to').value=todayISO(to);
+}
+async function loadData(){
   const f = new URLSearchParams();
-  const v_from = document.getElementById('from').value;
-  const v_to = document.getElementById('to').value;
-  const v_type = document.getElementById('type').value;
-  const v_cat = document.getElementById('category').value;
-  const v_q = document.getElementById('q').value;
+  const v_from=document.getElementById('from').value;
+  const v_to=document.getElementById('to').value;
+  const v_type=document.getElementById('type').value;
+  const v_cat=document.getElementById('category').value;
+  const v_q=document.getElementById('q').value;
+  if(v_from) f.set('from',v_from);
+  if(v_to)   f.set('to',v_to);
+  if(v_type) f.set('type',v_type);
+  if(v_cat)  f.set('category',v_cat);
+  if(v_q)    f.set('q',v_q);
 
-  if (v_from) f.set('from', v_from);
-  if (v_to) f.set('to', v_to);
-  if (v_type) f.set('type', v_type);
-  if (v_cat) f.set('category', v_cat);
-  if (v_q) f.set('q', v_q);
-
-  const resp = await fetch('/dashboard/data?' + f.toString());
-  if (!resp.ok) {{
-    alert('Errore nel caricamento dati ('+resp.status+')');
-    return;
-  }}
+  const resp = await fetch('/dashboard/data?'+f.toString());
+  if(!resp.ok){ alert('Errore nel caricamento dati ('+resp.status+')'); return; }
   const js = await resp.json();
 
-  document.getElementById('k_in').textContent  = fmt(js.totals.in)   + ' CHF';
-  document.getElementById('k_out').textContent = fmt(js.totals.out)  + ' CHF';
-  document.getElementById('k_net').textContent = fmt(js.totals.net)  + ' CHF';
+  document.getElementById('k_in').textContent  = fmt(js.totals.in)+' CHF';
+  document.getElementById('k_out').textContent = fmt(js.totals.out)+' CHF';
+  document.getElementById('k_net').textContent = fmt(js.totals.net)+' CHF';
 
-  const tb = document.querySelector('#tbl tbody');
-  tb.innerHTML = '';
-  if (!js.rows.length) {{
-    document.getElementById('empty').style.display='block';
-    return;
-  }} else {{
-    document.getElementById('empty').style.display='none';
-  }}
-  js.rows.forEach(r => {{
-    const tr = document.createElement('tr');
+  const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
+  if(!js.rows.length){ document.getElementById('empty').style.display='block'; return; }
+  else{ document.getElementById('empty').style.display='none'; }
+
+  js.rows.forEach(r=>{
+    const tr=document.createElement('tr');
     tr.innerHTML =
-      `<td>${{r.id}}</td>` +
-      `<td>${{r.type}}</td>` +
-      `<td class="right">${{fmt(r.amount)}}</td>` +
-      `<td>${{r.currency}}</td>` +
-      `<td>${{r.category}}</td>` +
-      `<td>${{r.note}}</td>` +
-      `<td>${{r.created_at}}</td>`;
+      `<td>${r.id}</td>`+
+      `<td>${r.type}</td>`+
+      `<td class="right">${fmt(r.amount)}</td>`+
+      `<td>${r.currency}</td>`+
+      `<td>${r.category}</td>`+
+      `<td>${r.note}</td>`+
+      `<td>${r.created_at}</td>`;
     tb.appendChild(tr);
-  }});
+  });
 
-  // aggiorna link PDF (usiamo /reports/pdf, ora whitelisted)
-  const pdfBtn = document.getElementById('pdf');
-  const p = new URLSearchParams();
-  if (v_from) p.set('from', v_from);
-  if (v_to)   p.set('to', v_to);
-  if (v_cat)  p.set('category', v_cat);
-  pdfBtn.onclick = () => window.open('/reports/pdf?' + p.toString(), '_blank');
-}}
+  const pdfBtn=document.getElementById('pdf');
+  const p=new URLSearchParams();
+  if(v_from) p.set('from',v_from);
+  if(v_to)   p.set('to',v_to);
+  if(v_cat)  p.set('category',v_cat);
+  pdfBtn.onclick=()=>window.open('/reports/pdf?'+p.toString(),'_blank');
+}
 document.getElementById('apply').addEventListener('click', loadData);
-setDefaults();
-loadData();
+setDefaults(); loadData();
 </script>
-</body></html>
-"""
+</body></html>"""
     return HTMLResponse(html)
-
