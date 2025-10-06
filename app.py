@@ -901,6 +901,8 @@ async def email_report(
 # ============================================================
 # DASHBOARD (HTML + API dati) — filtri, tabella, grafico, export
 # ============================================================
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
 @APP.get("/dashboard")
 async def dashboard(request: Request) -> HTMLResponse:
     html = f"""<!DOCTYPE html>
