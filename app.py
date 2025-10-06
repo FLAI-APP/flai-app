@@ -60,11 +60,12 @@ APP.add_middleware(
 
 @APP.middleware("http")
 async def security_and_rate_limit(request: Request, call_next):
-    # Whitelist: niente API key su healthz e dashboard (dashboard ha Basic Auth)
+# Whitelist: niente API key su queste rotte usate dal browser
     path = request.url.path
-    if path.startswith(("/healthz", "/webhook", "/dashboard", "/dashboard/data", "/dashboard/download")):
-        return await call_next(request)
-    # Tutto il resto richiede la chiave API
+    WHITELIST = ("/healthz", "/dashboard", "/dashboard/data", "/reports/pdf")
+    if path.startswith(WHITELIST):
+      return await call_next(request)
+
     x_api_key = request.headers.get("X-API-Key")
     if x_api_key != os.getenv("API_KEY_APP"):
         raise HTTPException(status_code=401, detail="invalid api key")
@@ -898,10 +899,85 @@ async def email_report(
 # === FINE EMAIL ===============================================================
 
 
-# ============================================================
-# DASHBOARD (HTML + API dati) — filtri, tabella, grafico, export
-# ============================================================
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+# ======================================================================
+# DASHBOARD (HTML + API dati) – filtri, tabella, grafico, export
+# ======================================================================
+
+from fastapi.responses import HTMLResponse, JSONResponse
+
+def _iso_or_none(s: str | None):
+    try:
+        import datetime as dt
+        return dt.date.fromisoformat(s) if s else None
+    except Exception:
+        return None
+
+def _like(s: str | None):
+    return f"%{s.strip()}%" if s and s.strip() else None
+
+def _fetch_dashboard_rows(conn, d_from, d_to, typ, category, q, limit=500):
+    qsql = """
+        SELECT id, type, amount::numeric(14,2), currency, category, coalesce(note,''), created_at
+        FROM movements
+        WHERE 1=1
+    """
+    params = []
+    if d_from:
+        qsql += " AND created_at::date >= %s"
+        params.append(d_from)
+    if d_to:
+        qsql += " AND created_at::date <= %s"
+        params.append(d_to)
+    if typ in ('in','out'):
+        qsql += " AND type = %s"
+        params.append(typ)
+    if category:
+        qsql += " AND category = %s"
+        params.append(category)
+    if q:
+        qsql += " AND (note ILIKE %s OR category ILIKE %s)"
+        params += [_like(q), _like(q)]
+    qsql += " ORDER BY created_at DESC LIMIT %s"
+    params.append(limit)
+
+    rows = []
+    with conn.cursor() as c:
+        c.execute(qsql, params)
+        for r in c.fetchall():
+            rows.append({
+                "id": r[0],
+                "type": r[1],
+                "amount": float(r[2]),
+                "currency": r[3],
+                "category": r[4],
+                "note": r[5],
+                "created_at": r[6].isoformat()
+            })
+    return rows
+
+@APP.get("/dashboard/data")
+async def dashboard_data(
+    request: Request,
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    type: str | None = None,
+    category: str | None = None,
+    q: str | None = None,
+):
+    d_from = _iso_or_none(from_)
+    d_to   = _iso_or_none(to)
+    typ    = type if type in ("in","out") else None
+    with get_conn() as conn:
+        rows = _fetch_dashboard_rows(conn, d_from, d_to, typ, category, q)
+    # totali
+    total_in  = sum(r["amount"] for r in rows if r["type"]=="in")
+    total_out = sum(r["amount"] for r in rows if r["type"]=="out")
+    return JSONResponse({
+        "ok": True,
+        "totals": {"in": total_in, "out": total_out, "net": total_in-total_out},
+        "rows": rows,
+        "count": len(rows)
+    })
 
 @APP.get("/dashboard")
 async def dashboard(request: Request) -> HTMLResponse:
@@ -913,121 +989,137 @@ async def dashboard(request: Request) -> HTMLResponse:
   <title>FLAI · Dashboard</title>
   <style>
     :root {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }}
-    body {{ margin: 0; background:#0b0c0f; color:#e6e6e6; }}
-    header {{ padding:16px 20px; border-bottom:1px solid #222; display:flex; gap:12px; align-items:center; }}
-    input, select, button {{ background:#121418; color:#e6e6e6; border:1px solid #2a2d34; border-radius:8px; padding:8px 10px; }}
-    button {{ cursor:pointer; }}
-    main {{ padding:20px; max-width:1100px; margin:0 auto; }}
-    .row {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    .card {{ background:#0f1116; border:1px solid #1e222a; border-radius:12px; padding:16px; }}
-    table {{ width:100%; border-collapse:collapse; }}
-    th, td {{ padding:10px; border-bottom:1px solid #1c1f26; text-align:left; }}
-    th {{ color:#9aa4b2; font-weight:600; }}
-    .kpi {{ display:flex; gap:16px; }}
-    .kpi .card {{ flex:1; }}
-    .muted {{ color:#9aa4b2; }}
-    a.btn {{ text-decoration:none; }}
+    body {{ margin:0; background:#0b0e0f; color:#e6e6e6; }}
+    header {{ padding:12px 20px; border-bottom:1px solid #0f1a22; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
+    .brand {{ font-weight:700; letter-spacing:.3px; }}
+    .bar {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+    input, select, button {{ background:#121a1f; color:#e6e6e6; border:1px solid #223d34; border-radius:8px; padding:8px 10px; }}
+    button.btn {{ background:#0e4a6c; border-color:#0e4a6c; cursor:pointer; }}
+    button.btn:hover {{ filter:brightness(1.1); }}
+    main {{ padding:18px; max-width:1100px; margin-inline:auto; }}
+    .kpis {{ display:flex; gap:12px; flex-wrap:wrap; }}
+    .card {{ background:#121a1f; border:1px solid #223d34; border-radius:12px; padding:14px; flex:1; min-width:220px; }}
+    .muted {{ color:#97a4ab; font-size:.9rem; }}
+    table {{ width:100%; border-collapse:collapse; margin-top:14px; }}
+    th,td {{ padding:10px; border-bottom:1px solid #1b262c; font-size:.95rem; }}
+    tr:hover td {{ background:#10181d; }}
+    .right {{ text-align:right; }}
+    .search {{ flex:1; min-width:180px; }}
+    a {{ color:#85bfe6; text-decoration:none; }}
   </style>
 </head>
 <body>
   <header>
-    <strong>FLAI · Dashboard</strong>
-    <input type="date" id="from" />
-    <input type="date" id="to" />
-    <select id="category">
-      <option value="">tutte le categorie</option>
-      <option value="sales">sales</option>
-      <option value="fornitori">fornitori</option>
-      <option value="test">test</option>
-    </select>
-    <button id="apply">Applica filtri</button>
-    <a id="download" class="btn" href="#" target="_blank">Scarica PDF</a>
+    <div class="brand">FLAI · Dashboard</div>
+    <div class="bar">
+      <label>Dal <input id="from" type="date"></label>
+      <label>Al <input id="to" type="date"></label>
+      <select id="type">
+        <option value="">tutti i tipi</option>
+        <option value="in">entrate</option>
+        <option value="out">uscite</option>
+      </select>
+      <input id="category" placeholder="categoria (es. sales, fornitori)" />
+      <input id="q" class="search" placeholder="cerca testo (note, categoria)"/>
+      <button id="apply" class="btn">Applica filtri</button>
+      <button id="pdf" class="btn">Scarica PDF</button>
+    </div>
   </header>
-
   <main>
-    <section class="kpi">
-      <div class="card"><div class="muted">Entrate</div><div id="kpi-in" style="font-size:22px;">–</div></div>
-      <div class="card"><div class="muted">Uscite</div><div id="kpi-out" style="font-size:22px;">–</div></div>
-      <div class="card"><div class="muted">Netto</div><div id="kpi-net" style="font-size:22px;">–</div></div>
-    </section>
+    <div class="kpis">
+      <div class="card"><div class="muted">Entrate</div><div id="k_in" style="font-size:1.3rem;margin-top:6px">–</div></div>
+      <div class="card"><div class="muted">Uscite</div><div id="k_out" style="font-size:1.3rem;margin-top:6px">–</div></div>
+      <div class="card"><div class="muted">Netto</div><div id="k_net" style="font-size:1.3rem;margin-top:6px">–</div></div>
+    </div>
 
-    <section class="card" style="margin-top:16px;">
-      <canvas id="chart" height="110"></canvas>
-    </section>
-
-    <section class="card" style="margin-top:16px;">
+    <div class="card" style="margin-top:14px;">
       <div class="muted" style="margin-bottom:8px;">Movimenti</div>
       <table id="tbl">
-        <thead><tr><th>id</th><th>tipo</th><th>amount</th><th>currency</th><th>category</th><th>note</th><th>created_at</th></tr></thead>
+        <thead>
+          <tr>
+            <th>id</th><th>tipo</th><th class="right">amount</th><th>currency</th><th>category</th><th>note</th><th>created_at</th>
+          </tr>
+        </thead>
         <tbody></tbody>
       </table>
-    </section>
+      <div id="empty" class="muted" style="display:none;margin-top:8px;">Nessun movimento per i filtri selezionati.</div>
+    </div>
   </main>
 
-  <script>
-  // Helpers querystring
-  const qs = new URLSearchParams(window.location.search);
-  const $ = (id) => document.getElementById(id);
+<script>
+function fmt(n) {{
+  try {{ return new Intl.NumberFormat('it-CH', {{minimumFractionDigits:2, maximumFractionDigits:2}}).format(n); }}
+  catch(e) {{ return n; }}
+}}
+function todayISO(d) {{
+  const z = (n)=> String(n).padStart(2,'0');
+  return d.getFullYear() + '-' + z(d.getMonth()+1) + '-' + z(d.getDate());
+}}
+function setDefaults() {{
+  const to = new Date();
+  const from = new Date(); from.setMonth(from.getMonth()-1);
+  document.getElementById('from').value = todayISO(from);
+  document.getElementById('to').value = todayISO(to);
+}}
+async function loadData() {{
+  const f = new URLSearchParams();
+  const v_from = document.getElementById('from').value;
+  const v_to = document.getElementById('to').value;
+  const v_type = document.getElementById('type').value;
+  const v_cat = document.getElementById('category').value;
+  const v_q = document.getElementById('q').value;
 
-  // Pre-popola filtri
-  if (qs.get('from')) $('from').value = qs.get('from');
-  if (qs.get('to')) $('to').value = qs.get('to');
-  if (qs.get('category')) $('category').value = qs.get('category');
+  if (v_from) f.set('from', v_from);
+  if (v_to) f.set('to', v_to);
+  if (v_type) f.set('type', v_type);
+  if (v_cat) f.set('category', v_cat);
+  if (v_q) f.set('q', v_q);
 
-  function buildQuery() {{
-    const p = new URLSearchParams();
-    if ($('from').value) p.set('from', $('from').value);
-    if ($('to').value) p.set('to', $('to').value);
-    if ($('category').value) p.set('category', $('category').value);
-    return p.toString();
+  const resp = await fetch('/dashboard/data?' + f.toString());
+  if (!resp.ok) {{
+    alert('Errore nel caricamento dati ('+resp.status+')');
+    return;
   }}
+  const js = await resp.json();
 
-  async function loadData() {{
-    const q = buildQuery();
-    const resp = await fetch('/dashboard/data' + (q ? '?' + q : ''));
-    if (!resp.ok) {{
-      console.error('HTTP', resp.status);
-      return;
-    }}
-    const data = await resp.json();
+  document.getElementById('k_in').textContent  = fmt(js.totals.in)   + ' CHF';
+  document.getElementById('k_out').textContent = fmt(js.totals.out)  + ' CHF';
+  document.getElementById('k_net').textContent = fmt(js.totals.net)  + ' CHF';
 
-    // KPI
-    $('kpi-in').textContent  = (data.kpi.in  ?? 0).toFixed(2);
-    $('kpi-out').textContent = (data.kpi.out ?? 0).toFixed(2);
-    $('kpi-net').textContent = (data.kpi.net ?? 0).toFixed(2);
-
-    // Tabella
-    const tb = $('tbl').querySelector('tbody');
-    tb.innerHTML = '';
-    for (const r of data.rows) {{
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td>${{r.id}}</td>
-        <td>${{r.type}}</td>
-        <td>${{r.amount.toFixed(2)}}</td>
-        <td>${{r.currency}}</td>
-        <td>${{r.category ?? ''}}</td>
-        <td>${{r.note ?? ''}}</td>
-        <td>${{r.created_at}}</td>`;
-      tb.appendChild(tr);
-    }}
-
-    // Link download PDF
-    const pdfQ = new URLSearchParams(q);
-    $('download').href = '/dashboard/download' + (pdfQ.toString() ? '?' + pdfQ.toString() : '');
+  const tb = document.querySelector('#tbl tbody');
+  tb.innerHTML = '';
+  if (!js.rows.length) {{
+    document.getElementById('empty').style.display='block';
+    return;
+  }} else {{
+    document.getElementById('empty').style.display='none';
   }}
-
-  $('apply').addEventListener('click', () => {{
-    const q = buildQuery();
-    const url = new URL(window.location.href);
-    url.search = q;
-    history.replaceState(null, '', url);
-    loadData();
+  js.rows.forEach(r => {{
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td>${{r.id}}</td>` +
+      `<td>${{r.type}}</td>` +
+      `<td class="right">${{fmt(r.amount)}}</td>` +
+      `<td>${{r.currency}}</td>` +
+      `<td>${{r.category}}</td>` +
+      `<td>${{r.note}}</td>` +
+      `<td>${{r.created_at}}</td>`;
+    tb.appendChild(tr);
   }});
 
-  loadData();
-  </script>
-</body>
-</html>
+  // aggiorna link PDF (usiamo /reports/pdf, ora whitelisted)
+  const pdfBtn = document.getElementById('pdf');
+  const p = new URLSearchParams();
+  if (v_from) p.set('from', v_from);
+  if (v_to)   p.set('to', v_to);
+  if (v_cat)  p.set('category', v_cat);
+  pdfBtn.onclick = () => window.open('/reports/pdf?' + p.toString(), '_blank');
+}}
+document.getElementById('apply').addEventListener('click', loadData);
+setDefaults();
+loadData();
+</script>
+</body></html>
 """
     return HTMLResponse(html)
+
