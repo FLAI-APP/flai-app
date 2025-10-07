@@ -939,7 +939,7 @@ def _check_basic_auth(request: Request) -> bool:
     except Exception:
         return False
 
-@app.middleware("http")
+@APP.middleware("http")
 async def _protect_dashboard(request: Request, call_next):
     # NB: mantieni il TUO middleware di rate-limit/sicurezza già esistente sopra.
     if _need_auth(request) and not _check_basic_auth(request):
@@ -1021,7 +1021,7 @@ def _sum_in_out(rows: List[Dict]) -> Dict[str, float]:
     return {"in": round(_in, 2), "out": round(_out, 2), "net": round(_in - _out, 2)}
 
 # ---------- API DATI (JSON) ----------
-@app.get("/dashboard/data")
+@APP.get("/dashboard/data")
 async def dashboard_data(request: Request,
                          dfrom: Optional[str] = None,
                          dto: Optional[str] = None,
@@ -1043,7 +1043,7 @@ async def dashboard_data(request: Request,
     return JSONResponse({"ok": True, "rows": rows, "sums": sums})
 
 # ---------- HTML ----------
-@app.get("/dashboard")
+@APP.get("/dashboard")
 async def dashboard(request: Request) -> HTMLResponse:
     # default intervallo: ultimo mese
     today = _date.today()
@@ -1236,7 +1236,7 @@ loadData(); // carica subito con default
     return HTMLResponse(content=html)
 
 # ---------- PDF ----------
-@app.get("/reports/pdf")
+@APP.get("/reports/pdf")
 async def reports_pdf(request: Request,
                       from_: Optional[str] = None,
                       to: Optional[str] = None,
