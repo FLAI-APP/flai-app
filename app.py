@@ -1119,7 +1119,7 @@ async def dashboard_pdf(request: Request,
 
 # ------------------ HTML Dashboard ------------------
 
-k@APP.get("/dashboard", response_class=HTMLResponse)
+@APP.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
     logo_html = f'<img src="{LOGO_URL}" alt="logo" class="logo"/>' if LOGO_URL else ""
     # NOTA: niente f-string qui; usiamo segnaposto e .replace() per evitare conflitti con ${...} del JS
