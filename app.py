@@ -1119,68 +1119,60 @@ async def dashboard_pdf(request: Request,
 
 # ------------------ HTML Dashboard ------------------
 
-@APP.get("/dashboard", response_class=HTMLResponse)
+k@APP.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
     logo_html = f'<img src="{LOGO_URL}" alt="logo" class="logo"/>' if LOGO_URL else ""
-    html = f"""
-<!doctype html>
+    # NOTA: niente f-string qui; usiamo segnaposto e .replace() per evitare conflitti con ${...} del JS
+    tpl = r"""<!doctype html>
 <html lang="it">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>FLAI · Dashboard</title>
   <style>
-    :root {{
-      --brand: {BRAND_BLUE};
-      --gold: {ACCENT_GOLD};
+    :root {
+      --brand: %%BRAND%%;
+      --gold: %%GOLD%%;
       --bg: #0c0f14;
       --panel: #1c222b;
       --panel-2: #232b35;
       --text: #e8edf4;
       --muted: #9aa7b4;
-      --ok: #19c37d;
-      --bad: #ff6363;
       --radius: 10px;
-    }}
-    * {{ box-sizing:border-box; }}
-    html, body {{ margin:0; background:var(--bg); color:var(--text); font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }}
-    header.top {{
-      background: var(--brand);
-      padding: 10px 16px;
-      display:flex; align-items:center; gap:16px;
-      position:sticky; top:0; z-index:10;
-      border-bottom: 1px solid rgba(255,255,255,.06);
-    }}
-    .logo {{ width:28px; height:28px; border-radius:6px; object-fit:cover; filter: brightness(.85) saturate(1.05); }}
-    .brand {{ font-weight:800; letter-spacing:.5px; }}
-    .bar {{ display:flex; gap:8px; align-items:center; }}
-    .btn {{ background:var(--gold); color:#121212; border:none; padding:8px 12px; border-radius:8px; font-weight:700; cursor:pointer; }}
-    .btn:disabled {{ opacity:.6; cursor:not-allowed; }}
-    .pill {{ background:var(--panel); border:1px solid #2f3947; color:var(--text); padding:8px 10px; border-radius:8px; }}
-    main {{ max-width:1100px; margin:18px auto; padding:0 16px; display:grid; gap:14px; }}
-    .cards {{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap:14px; }}
-    .card {{ background:var(--panel); border:1px solid #2f3947; border-radius: var(--radius); padding:14px 16px; }}
-    .title {{ color:var(--muted); font-weight:700; margin-bottom:6px; }}
-    .val {{ font-size:18px; font-weight:900; }}
-    .table {{ background:var(--panel); border:1px solid #2f3947; border-radius: var(--radius); overflow:hidden; }}
-    table {{ width:100%; border-collapse:collapse; }}
-    thead th {{ text-align:left; font-size:12px; letter-spacing:.6px; color:var(--muted); padding:10px 12px; background:var(--panel-2); }}
-    tbody td {{ padding:12px; border-top:1px solid #2f3947; }}
-    colgroup col.id {{ width:6ch; }}
-    colgroup col.type {{ width:8ch; }}
-    colgroup col.amount {{ width:12ch; }}
-    colgroup col.curr {{ width:8ch; }}
-    colgroup col.cat {{ width:22ch; }}      /* più spazio a CATEGORY */
-    colgroup col.note {{ width:auto; }}     /* meno spazio rispetto a prima */
-    colgroup col.created {{ width:18ch; text-align:right; }}
-    .right {{ text-align:right; }}
-    .muted {{ color:var(--muted); }}
-    .toast {{ position:fixed; inset:auto 12px 12px auto; background:#2f3947; color:#fff; padding:10px 12px; border-radius:8px; display:none; }}
+    }
+    * { box-sizing:border-box; }
+    html, body { margin:0; background:var(--bg); color:var(--text); font: 14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+    header.top { background:var(--brand); padding:10px 16px; display:flex; align-items:center; gap:16px; position:sticky; top:0; z-index:10; border-bottom:1px solid rgba(255,255,255,.06); }
+    .logo { width:28px; height:28px; border-radius:6px; object-fit:cover; filter: brightness(.85) saturate(1.05); }
+    .brand { font-weight:800; letter-spacing:.5px; }
+    .bar { display:flex; gap:8px; align-items:center; }
+    .btn { background:var(--gold); color:#121212; border:none; padding:8px 12px; border-radius:8px; font-weight:700; cursor:pointer; }
+    .btn:disabled { opacity:.6; cursor:not-allowed; }
+    .pill { background:var(--panel); border:1px solid #2f3947; color:var(--text); padding:8px 10px; border-radius:8px; }
+    main { max-width:1100px; margin:18px auto; padding:0 16px; display:grid; gap:14px; }
+    .cards { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:14px; }
+    .card { background:var(--panel); border:1px solid #2f3947; border-radius: var(--radius); padding:14px 16px; }
+    .title { color:var(--muted); font-weight:700; margin-bottom:6px; }
+    .val { font-size:18px; font-weight:900; }
+    .table { background:var(--panel); border:1px solid #2f3947; border-radius: var(--radius); overflow:hidden; }
+    table { width:100%; border-collapse:collapse; }
+    thead th { text-align:left; font-size:12px; letter-spacing:.6px; color:var(--muted); padding:10px 12px; background:var(--panel-2); }
+    tbody td { padding:12px; border-top:1px solid #2f3947; }
+    colgroup col.id { width:6ch; }      /* ID piccolo */
+    colgroup col.type { width:8ch; }
+    colgroup col.amount { width:12ch; }
+    colgroup col.curr { width:8ch; }
+    colgroup col.cat { width:22ch; }    /* più spazio a CATEGORY */
+    colgroup col.note { width:auto; }   /* meno spazio a NOTE */
+    colgroup col.created { width:18ch; }
+    .right { text-align:right; }
+    .muted { color:var(--muted); }
+    .toast { position:fixed; inset:auto 12px 12px auto; background:#2f3947; color:#fff; padding:10px 12px; border-radius:8px; display:none; }
   </style>
 </head>
 <body>
   <header class="top">
-    {logo_html}
+    %%LOGO_HTML%%
     <div class="brand">FLAI · Dashboard</div>
     <div class="bar" style="flex:1; justify-content:center;">
       <span>Dal</span>
@@ -1226,16 +1218,18 @@ async def dashboard_page(request: Request):
     const byId = (x) => document.getElementById(x);
     const elFrom = byId('from'), elTo = byId('to'), elTyp = byId('typ'), elQ = byId('q');
     const elIn = byId('in'), elOut = byId('out'), elNet = byId('net'), elRows = byId('rows');
-    const todayISO = () => new Date().toISOString().slice(0,10);
 
     // default: ultimo mese
     const today = new Date();
     const lastMonth = new Date(today); lastMonth.setMonth(today.getMonth()-1);
-    elFrom.value = lastMonth.toISOString().slice(0,10);
-    elTo.value = todayISO();
+    const iso = d => d.toISOString().slice(0,10);
+    elFrom.value = iso(lastMonth);
+    elTo.value = iso(today);
 
     function toast(msg){
-      const t = byId('toast'); t.textContent = msg; t.style.display = 'block';
+      const t = byId('toast');
+      t.textContent = msg;
+      t.style.display = 'block';
       setTimeout(()=> t.style.display='none', 2500);
     }
 
@@ -1247,10 +1241,7 @@ async def dashboard_page(request: Request):
       if (elQ.value)    p.set('q', elQ.value);
 
       const resp = await fetch('/dashboard/data?' + p.toString(), {cache:'no-store'});
-      if(!resp.ok){
-        toast('Errore nel caricamento dati ('+resp.status+')');
-        return;
-      }
+      if(!resp.ok){ toast('Errore nel caricamento dati ('+resp.status+')'); return; }
       const data = await resp.json();
       elIn.textContent = data.in + ' CHF';
       elOut.textContent = data.out + ' CHF';
@@ -1282,9 +1273,12 @@ async def dashboard_page(request: Request):
       window.open('/dashboard/pdf?' + p.toString(), '_blank');
     });
 
-    load(); // primo caricamento
+    load();
   </script>
 </body>
-</html>
-"""
+</html>"""
+    html = (tpl
+            .replace("%%BRAND%%", BRAND_BLUE)
+            .replace("%%GOLD%%", ACCENT_GOLD)
+            .replace("%%LOGO_HTML%%", logo_html))
     return HTMLResponse(content=html)
