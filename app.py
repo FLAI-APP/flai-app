@@ -904,34 +904,37 @@ async def email_report(
 # ==============================================================
 
 import os, io, json, base64, datetime as dt
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any, Dict
 from decimal import Decimal
 
 from fastapi import Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-# ---- Brand (personalizzabile via ENV) ----
-BRAND_BLUE = os.getenv("BRAND_BLUE", "#000A22")   # blu del brand
-ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#AA8F15") # oro accent
-LOGO_URL = os.getenv("LOGO_URL", "")              # logo PNG/JPG/SVG
+# ---- Brand da ENV (puoi regolare per matchare il logo) ----
+BRAND_BLUE  = os.getenv("BRAND_BLUE",  "#0B1E3A")   # un pelo più CHIARO del precedente
+ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#AA8F15")
+LOGO_URL    = os.getenv("LOGO_URL", "")
 
-# ---- Helpers per la dashboard ----
+# ---------- Helpers ----------
 def _iso_or_none(s: Optional[str]) -> Optional[dt.date]:
-    if not s:
-        return None
-    try:
-        return dt.date.fromisoformat(s)
-    except Exception:
-        return None
+    if not s: return None
+    try: return dt.date.fromisoformat(s)
+    except Exception: return None
 
 def _like_or_none(s: Optional[str]) -> Optional[str]:
     return f"%{s.strip()}%" if s and s.strip() else None
 
+def _get_val(row, key, idx):
+    """Compat: estrae valore sia da dict-row che da tuple-row."""
+    try:
+        return row[key]
+    except Exception:
+        return row[idx]
+
 def _fetch_rows_and_totals(conn, d_from: Optional[dt.date], d_to: Optional[dt.date],
                            typ: str, q: Optional[str]) -> Dict[str, Any]:
-    # rows
     sql = """
-        SELECT id, type, amount::numeric(14,2), currency, category, COALESCE(note,'') AS note, created_at
+        SELECT id, type, amount::numeric(14,2) AS amount, currency, category, COALESCE(note,'') AS note, created_at
         FROM movements
         WHERE 1=1
     """
@@ -946,20 +949,22 @@ def _fetch_rows_and_totals(conn, d_from: Optional[dt.date], d_to: Optional[dt.da
         sql += " AND type = %s"
         params.append(typ)
     if q:
-        sql += " AND (CAST(id AS TEXT) ILIKE %s OR type ILIKE %s OR currency ILIKE %s OR category ILIKE %s OR note ILIKE %s)"
         like = _like_or_none(q)
-        params.extend([like, like, like, like, like])
+        sql += """ AND (
+            CAST(id AS TEXT) ILIKE %s OR type ILIKE %s OR currency ILIKE %s OR
+            category ILIKE %s OR note ILIKE %s
+        )"""
+        params += [like, like, like, like, like]
     sql += " ORDER BY created_at DESC LIMIT 500"
 
-    # totals
     tsql = """
         SELECT
-            COALESCE(SUM(CASE WHEN type='in'  THEN amount ELSE 0 END),0)::numeric(14,2) AS tin,
-            COALESCE(SUM(CASE WHEN type='out' THEN amount ELSE 0 END),0)::numeric(14,2) AS tout
+          COALESCE(SUM(CASE WHEN type='in'  THEN amount ELSE 0 END),0)::numeric(14,2) AS tin,
+          COALESCE(SUM(CASE WHEN type='out' THEN amount ELSE 0 END),0)::numeric(14,2) AS tout
         FROM movements
         WHERE 1=1
     """
-    tparams = []
+    tparams: List[Any] = []
     if d_from:
         tsql += " AND created_at::date >= %s"
         tparams.append(d_from)
@@ -970,9 +975,12 @@ def _fetch_rows_and_totals(conn, d_from: Optional[dt.date], d_to: Optional[dt.da
         tsql += " AND type = %s"
         tparams.append(typ)
     if q:
-        tsql += " AND (CAST(id AS TEXT) ILIKE %s OR type ILIKE %s OR currency ILIKE %s OR category ILIKE %s OR note ILIKE %s)"
         like = _like_or_none(q)
-        tparams.extend([like, like, like, like, like])
+        tsql += """ AND (
+            CAST(id AS TEXT) ILIKE %s OR type ILIKE %s OR currency ILIKE %s OR
+            category ILIKE %s OR note ILIKE %s
+        )"""
+        tparams += [like, like, like, like, like]
 
     with get_conn() as c, c.cursor() as cur:
         cur.execute(sql, params)
@@ -980,30 +988,36 @@ def _fetch_rows_and_totals(conn, d_from: Optional[dt.date], d_to: Optional[dt.da
         cur.execute(tsql, tparams)
         tin, tout = cur.fetchone()
 
-    # normalizza righe per JSON
     out_rows = []
     for r in rows:
-        rid, rtype, amount, currency, category, note, created_at = r
+        rid       = _get_val(r, "id",         0)
+        rtype     = _get_val(r, "type",       1)
+        amount    = _get_val(r, "amount",     2)
+        currency  = _get_val(r, "currency",   3)
+        category  = _get_val(r, "category",   4)
+        note      = _get_val(r, "note",       5)
+        created_at= _get_val(r, "created_at", 6)
+        # normalizza tipi
+        try:
+            amount_f = float(amount)
+        except Exception:
+            amount_f = float(str(amount))
+        created_iso = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
         out_rows.append({
-            "id": rid,
-            "type": rtype,
-            "amount": float(amount),
-            "currency": currency,
-            "category": category,
-            "note": note,
-            "created_at": created_at.isoformat()
+            "id": rid, "type": rtype, "amount": amount_f, "currency": currency,
+            "category": category, "note": note, "created_at": created_iso
         })
 
     return {"rows": out_rows, "in_total": float(tin), "out_total": float(tout)}
 
-# ---- API dati per la dashboard ----
+# ---------- API dati ----------
 @APP.get("/dashboard/data")
 async def dashboard_data(
     request: Request,
     from_: Optional[str] = Query(default=None, alias="from"),
     to: Optional[str] = None,
-    type: str = "all",             # all | in | out
-    q: Optional[str] = None
+    type: str = "all",
+    q: Optional[str] = None,
 ):
     d_from = _iso_or_none(from_)
     d_to   = _iso_or_none(to)
@@ -1013,94 +1027,76 @@ async def dashboard_data(
         data = _fetch_rows_and_totals(get_conn(), d_from, d_to, type, q)
         return JSONResponse({"ok": True, **data})
     except Exception as e:
-        # log minimale
         return JSONResponse({"ok": False, "error": "db_failed", "detail": str(e)}, status_code=500)
 
-# ---- HTML Dashboard ----
+# ---------- HTML ----------
 @APP.get("/dashboard")
 async def dashboard(request: Request) -> HTMLResponse:
-    # ATT: uso triple-quoted string con DOPPIE parentesi per evitare problemi con f-string/JS
-    html = f"""
-<!doctype html>
-<html lang="it">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+    html = f"""<!doctype html>
+<html lang="it"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>FLAI · Dashboard</title>
 <style>
 :root {{
-  --brand-blue: {BRAND_BLUE};
-  --accent-gold: {ACCENT_GOLD};
-  --bg: #0f141b; --panel:#1c2430; --text:#e8eef6; --muted:#9aa4b2; --ok:#a8ffb0;
+  --brand-blue:{BRAND_BLUE};
+  --accent-gold:{ACCENT_GOLD};
+  --bg:#0f141b; --panel:#1c2430; --text:#e8eef6; --muted:#9aa4b2; --line:#2a3a4d;
   --radius:12px;
 }}
-* {{ box-sizing: border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--text); font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial; }}
 
-.header {{
-  background: var(--brand-blue);
-  padding: 8px 16px;
-  display: flex; align-items: center; gap: 12px;
-}}
-.brand {{ display:flex; align-items:center; gap:10px; }}
-.brand img {{
-  height: 28px; width: 28px; object-fit: contain;
-  /* workaround per rendere il logo leggermente più scuro come lo sfondo */
-  filter: brightness(0.92) saturate(1.05);
-}}
-.brand-name {{ font-weight: 700; letter-spacing: .3px; }}
+.header {{ background:var(--brand-blue); padding:10px 16px; }}
+.header-inner {{ display:flex; align-items:center; gap:14px; }}
+.brand img {{ height:28px; width:28px; object-fit:contain; filter:brightness(.85) saturate(1.05); }}
+.brand-name {{ font-weight:800; letter-spacing:.3px; }}
 
-.toolbar {{
-  margin: 10px 16px 0 16px;
-  display:flex; align-items:center; gap:10px;
-}}
+.toolbar {{ margin-top:10px; display:flex; align-items:center; gap:10px; }}
 .toolbar .grow {{ flex:1; }}
-input, select {{ background:#0f141b; color:var(--text); border:1px solid #2a3a4d; border-radius:8px; padding:8px 10px; }}
-button.btn {{ background: var(--accent-gold); color:#111; border:none; padding:8px 12px; border-radius:10px; font-weight:600; cursor:pointer; }}
-button.btn:active {{ transform: translateY(1px); }}
+input, select {{ background:#0f141b; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 10px; }}
+button.btn {{ background:var(--accent-gold); color:#111; border:none; padding:8px 12px; border-radius:10px; font-weight:700; cursor:pointer; }}
+button.btn:active {{ transform:translateY(1px); }}
 
-.kpis {{ display:flex; gap:16px; margin:12px 16px; }}
-.card {{ background:var(--panel); border:1px solid #2a3a4d; border-radius:var(--radius); padding:14px 16px; flex:1; }}
-.card h4 {{ margin:0 0 8px 0; font-size:12px; font-weight:700; color:var(--muted); letter-spacing:.6px; }}
+.kpis {{ display:flex; gap:16px; margin:14px 16px; }}
+.card {{ background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:14px 16px; flex:1; }}
+.card h4 {{ margin:0 0 8px 0; font-size:12px; color:var(--muted); letter-spacing:.6px; }}
 .card .value {{ font-size:18px; font-weight:800; }}
 
-.table-wrap {{ background:var(--panel); border:1px solid #2a3a4d; border-radius:var(--radius); margin:0 16px 30px 16px; overflow:auto; }}
-table {{ width:100%; border-collapse: collapse; table-layout: fixed; }}
-th, td {{ padding:10px 12px; border-bottom:1px solid #2a3a4d; text-align:left; }}
+.table-wrap {{ background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); margin:0 16px 30px 16px; overflow:auto; }}
+table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
+th,td {{ padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; }}
 th {{ color:var(--muted); font-size:12px; letter-spacing:.6px; }}
-th:nth-child(1) {{ width:64px; }}
-th:nth-child(2) {{ width:88px; }}
-th:nth-child(3) {{ width:120px; }} /* AMOUNT allineato */
-th:nth-child(4) {{ width:96px; }}
-td.amount {{ font-variant-numeric: tabular-nums; text-align:right; }}
-td.created {{ white-space: nowrap; }}
-
-.badge {{ background:#0f141b; border:1px solid #2a3a4d; color:var(--text); padding:6px 10px; border-radius:8px; font-size:12px; }}
-.right {{ display:flex; align-items:center; gap:10px; justify-content:flex-end; }}
+th:nth-child(1) {{ width:60px;  }}  /* ID piccolo */
+th:nth-child(2) {{ width:90px;  }}  /* TYPE piccolo */
+th:nth-child(3) {{ width:130px; }}  /* AMOUNT medio */
+th:nth-child(4) {{ width:90px;  }}  /* CURRENCY piccolo */
+th:nth-child(5) {{ width:170px; }}  /* CATEGORY medio */
+th:nth-child(6) {{ width:auto;  }}  /* NOTE largo */
+th:nth-child(7) {{ width:160px; }}  /* CREATED AT medio */
+td.amount {{ text-align:right; font-variant-numeric:tabular-nums; }}
+td.created {{ white-space:nowrap; }}
 </style>
 </head>
 <body>
   <div class="header">
-    <div class="brand">
-      <div style="height:28px;width:28px;border-radius:6px;background:var(--brand-blue);display:grid;place-items:center;">
+    <div class="header-inner">
+      <div class="brand">
         {"<img src='"+LOGO_URL+"' alt='logo'/>" if LOGO_URL else ""}
       </div>
       <div class="brand-name">FLAI · Dashboard</div>
     </div>
-  </div>
-
-  <div class="toolbar">
-    <label>Dal</label><input type="date" id="from">
-    <label>al</label><input type="date" id="to">
-    <select id="typ">
-      <option value="all">TUTTI I TIPI</option>
-      <option value="in">SOLO ENTRATE</option>
-      <option value="out">SOLO USCITE</option>
-    </select>
-    <input id="q" placeholder="cerca testo (id, tipo, amount, note, categoria)" style="min-width:260px;">
-    <button class="btn" id="apply">Applica filtri</button>
-    <div class="grow"></div>
-    <div class="right">
+    <!-- Toolbar dentro la barra blu -->
+    <div class="toolbar">
+      <label>Dal</label><input type="date" id="from">
+      <label>al</label><input type="date" id="to">
+      <select id="typ">
+        <option value="all">TUTTI I TIPI</option>
+        <option value="in">SOLO ENTRATE</option>
+        <option value="out">SOLO USCITE</option>
+      </select>
+      <input id="q" placeholder="cerca testo (id, tipo, amount, note, categoria)" style="min-width:260px;">
+      <button class="btn" id="apply">Applica filtri</button>
+      <div class="grow"></div>
       <button class="btn" id="pdf">Scarica PDF</button>
     </div>
   </div>
@@ -1125,7 +1121,7 @@ td.created {{ white-space: nowrap; }}
 <script>
 (function() {{
   const fmtMoney = new Intl.NumberFormat('it-CH', {{style:'decimal', minimumFractionDigits:2, maximumFractionDigits:2}});
-  function CHF(n) {{ return fmtMoney.format(n) + " CHF"; }}
+  const CHF = n => fmtMoney.format(n) + " CHF";
 
   const elFrom = document.getElementById('from');
   const elTo   = document.getElementById('to');
@@ -1142,42 +1138,37 @@ td.created {{ white-space: nowrap; }}
   elTo.value   = today.toISOString().slice(0,10);
 
   async function load() {{
-    const params = new URLSearchParams();
-    if (elFrom.value) params.set('from', elFrom.value);
-    if (elTo.value)   params.set('to', elTo.value);
-    if (elTyp.value !== 'all') params.set('type', elTyp.value);
-    if (elQ.value.trim()) params.set('q', elQ.value.trim());
+    const p = new URLSearchParams();
+    if (elFrom.value) p.set('from', elFrom.value);
+    if (elTo.value)   p.set('to', elTo.value);
+    if (elTyp.value !== 'all') p.set('type', elTyp.value);
+    if (elQ.value.trim()) p.set('q', elQ.value.trim());
 
-    const r = await fetch('/dashboard/data?' + params.toString(), {{ headers: {{ 'X-API-Key': '{os.getenv("API_KEY_APP","")}' }} }});
-    if (!r.ok) {{
-      alert('Errore nel caricamento dati (' + r.status + ')');
-      return;
-    }}
+    const r = await fetch('/dashboard/data?' + p.toString(), {{
+      headers: {{ 'X-API-Key': '{os.getenv("API_KEY_APP","")}' }}
+    }});
+    if (!r.ok) {{ alert('Errore nel caricamento dati ('+r.status+')'); return; }}
     const j = await r.json();
-    if (!j.ok) {{
-      alert('Errore: ' + (j.error || 'unknown'));
-      return;
-    }}
+    if (!j.ok) {{ alert('Errore: ' + (j.error||'unknown')); return; }}
 
-    // kpi
+    // KPI
     document.getElementById('v_in').textContent  = CHF(j.in_total);
     document.getElementById('v_out').textContent = CHF(j.out_total);
     document.getElementById('v_net').textContent = CHF(j.in_total - j.out_total);
 
-    // table
+    // Tabella
     tb.innerHTML = '';
     for (const row of j.rows) {{
-      const tr = document.createElement('tr');
-      const d  = new Date(row.created_at);
+      const d = new Date(row.created_at);
       const nice = d.toLocaleDateString('it-CH') + ' ' + d.toLocaleTimeString('it-CH', {{hour:'2-digit', minute:'2-digit'}});
-
+      const tr = document.createElement('tr');
       tr.innerHTML = `
         <td>${{row.id}}</td>
         <td>${{row.type}}</td>
         <td class="amount">${{fmtMoney.format(row.amount)}}</td>
         <td>${{row.currency}}</td>
-        <td>${{row.category || ''}}</td>
-        <td>${{row.note || ''}}</td>
+        <td>${{row.category||''}}</td>
+        <td>${{row.note||''}}</td>
         <td class="created">${{nice}}</td>
       `;
       tb.appendChild(tr);
@@ -1185,20 +1176,18 @@ td.created {{ white-space: nowrap; }}
   }}
 
   elApply.addEventListener('click', load);
-  document.addEventListener('keydown', (e)=>{{ if (e.key === 'Enter') load(); }});
+  document.addEventListener('keydown', (e)=>{{ if (e.key==='Enter') load(); }});
   elPDF.addEventListener('click', ()=>{{
-    const params = new URLSearchParams();
-    if (elFrom.value) params.set('from', elFrom.value);
-    if (elTo.value)   params.set('to', elTo.value);
-    if (elTyp.value !== 'all') params.set('type', elTyp.value);
-    if (elQ.value.trim()) params.set('q', elQ.value.trim());
-    window.location.href = '/reports/pdf?' + params.toString();
+    const p = new URLSearchParams();
+    if (elFrom.value) p.set('from', elFrom.value);
+    if (elTo.value)   p.set('to', elTo.value);
+    if (elTyp.value !== 'all') p.set('type', elTyp.value);
+    if (elQ.value.trim()) p.set('q', elQ.value.trim());
+    window.location.href = '/reports/pdf?' + p.toString();
   }});
 
   load();
 }})();
 </script>
-</body>
-</html>
-"""
+</body></html>"""
     return HTMLResponse(content=html)
