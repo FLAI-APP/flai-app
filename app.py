@@ -899,221 +899,366 @@ async def email_report(
 # === FINE EMAIL ===============================================================
 
 
-# ======================================================================
-# DASHBOARD (HTML + API dati) – filtri, tabella, export PDF
-# ======================================================================
+# =============================================================================
+# DASHBOARD (HTML + API dati) – filtri, tabella, grafico, export PDF + BasicAuth
+# =============================================================================
+import os, io, json, base64
+from typing import Any, Dict, List, Optional
+from datetime import date as _date, datetime, timezone
+from decimal import Decimal
 
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi import Query
-import datetime as dt
+from fastapi import Request, Query, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-def _iso_or_none(s: str | None):
+# Tema/branding (personalizzabili da ENV)
+BRAND_BLUE = os.getenv("BRAND_BLUE", "#0b2a44")
+ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#ffc652")
+LOGO_URL = os.getenv("LOGO_URL", "")  # URL pubblico PNG/JPG/SVG; opzionale
+
+# --- Basic Auth: usa le tue ENV esistenti (DASHBOARD_USER / DASHBOARD_PASSWORD) ---
+DASH_USER = os.getenv("DASHBOARD_USER") or os.getenv("DASH_USER") or ""
+DASH_PASS = os.getenv("DASHBOARD_PASSWORD") or os.getenv("DASH_PASS") or ""
+
+PROTECTED_PREFIXES = ("/dashboard", "/analytics", "/reports/pdf")
+
+def _needs_auth(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in PROTECTED_PREFIXES)
+
+@APP.middleware("http")
+async def dashboard_basic_auth(request: Request, call_next):
+    """Protegge /dashboard (e affini) con Basic Auth, ma lascia liberi /healthz e il webhook."""
+    path = request.url.path
+    # whitelist già gestita dal tuo altro middleware; qui lasciamo anche healthz e webhook
+    if path in {"/", "/healthz", "/webhook", "/webhook/verify"}:
+        return await call_next(request)
+
+    if _needs_auth(path):
+        ok = False
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("basic ") and DASH_USER and DASH_PASS:
+            try:
+                user_pwd = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
+                usr, pwd = (user_pwd.split(":", 1) + [""])[:2]
+                ok = (usr == DASH_USER and pwd == DASH_PASS)
+            except Exception:
+                ok = False
+        if not ok:
+            return HTMLResponse(
+                status_code=401,
+                headers={"WWW-Authenticate": "Basic realm=FLAI Dashboard"},
+                content="<h3 style='color:#fff;font-family:system-ui;background:#000;margin:0;padding:24px'>Unauthorized</h3>",
+            )
+    return await call_next(request)
+
+# ----------------------------- helpers DB + formattazione -----------------------------
+def _iso_or_none(s: Optional[str]) -> Optional[_date]:
     try:
-        return dt.date.fromisoformat(s) if s else None
+        return _date.fromisoformat(s) if s else None
     except Exception:
         return None
 
-def _like(s: str | None):
+def _like(s: Optional[str]) -> Optional[str]:
     return f"%{s.strip()}%" if s and s.strip() else None
 
-def _fetch_dashboard_rows(conn, d_from, d_to, typ, category, q, limit=500):
-    # NB: alias espliciti per avere chiavi pulite col row_factory=dict_row
-    qsql = """
-        SELECT
-            id,
-            type,
-            amount::numeric(14,2) AS amount,
-            currency,
-            category,
-            COALESCE(note,'')     AS note,
-            created_at
-        FROM movements
-        WHERE 1=1
-    """
-    params = []
-    if d_from:
-        qsql += " AND created_at::date >= %s"
-        params.append(d_from)
-    if d_to:
-        qsql += " AND created_at::date <= %s"
-        params.append(d_to)
-    if typ in ('in','out'):
-        qsql += " AND type = %s"
-        params.append(typ)
-    if category:
-        qsql += " AND category = %s"
-        params.append(category)
-    if q:
-        qsql += " AND (note ILIKE %s OR category ILIKE %s)"
-        like = _like(q)
-        params += [like, like]
+def _fmt_money(x: Optional[Decimal]) -> str:
+    if x is None:
+        return "0.00"
+    try:
+        return f"{Decimal(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return str(x)
 
-    qsql += " ORDER BY created_at DESC LIMIT %s"
-    params.append(limit)
+def _fmt_dt(ts: str) -> str:
+    # converte "2025-09-30T16:39:30.035773" -> "2025-09-30 16:39"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = dt.astimezone(timezone.utc)  # evita tz strane, ma puoi rimuovere se vuoi locale
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ts
 
-    rows = []
-    with conn.cursor() as c:
-        c.execute(qsql, params)
-        for r in c.fetchall():  # r è un dict grazie a row_factory=dict_row
-            rows.append({
-                "id": r["id"],
-                "type": r["type"],
-                "amount": float(r["amount"]),
-                "currency": r["currency"],
-                "category": r["category"],
-                "note": r["note"],
-                "created_at": r["created_at"].isoformat()
-            })
-    return rows
-
-@APP.get("/dashboard/data")
+# ----------------------------- API dati per la dashboard ------------------------------
+@APP.get("/dashboard_data")
 async def dashboard_data(
     request: Request,
-    from_: str | None = Query(None, alias="from"),
-    to: str | None = None,
-    type: str | None = None,
-    category: str | None = None,
-    q: str | None = None,
+    frm: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = Query(None, alias="to"),
+    typ: str = Query("all", pattern="^(all|in|out)$"),
+    category: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=2000),
 ):
-    d_from = _iso_or_none(from_)
-    d_to   = _iso_or_none(to)
-    typ    = type if type in ("in","out") else None
+    d_from = _iso_or_none(frm)
+    d_to = _iso_or_none(to)
+    like_cat = _like(category)
+    like_q = _like(q)
 
-    with get_conn() as conn:
-        rows = _fetch_dashboard_rows(conn, d_from, d_to, typ, category, q)
+    try:
+        with get_conn() as conn, conn.cursor() as c:
+            qsql = """
+                SELECT id, type, amount::numeric(14,2), currency, category, coalesce(note,''), created_at
+                FROM movements
+                WHERE 1=1
+            """
+            params: List[Any] = []
+            if d_from:
+                qsql += " AND created_at::date >= %s"
+                params.append(d_from)
+            if d_to:
+                qsql += " AND created_at::date <= %s"
+                params.append(d_to)
+            if typ in ("in","out"):
+                qsql += " AND type = %s"
+                params.append(typ)
+            if like_cat:
+                qsql += " AND category ILIKE %s"
+                params.append(like_cat)
+            if like_q:
+                qsql += " AND (note ILIKE %s OR category ILIKE %s)"
+                params += [like_q, like_q]
 
-    total_in  = sum(r["amount"] for r in rows if r["type"] == "in")
-    total_out = sum(r["amount"] for r in rows if r["type"] == "out")
+            qsql += " ORDER BY created_at DESC, id DESC LIMIT %s"
+            params.append(limit)
+            c.execute(qsql, params)
+            rows = c.fetchall()
 
-    return JSONResponse({
-        "ok": True,
-        "totals": {"in": total_in, "out": total_out, "net": total_in - total_out},
-        "rows": rows,
-        "count": len(rows)
-    })
+            # totali
+            def _sum(kind: str) -> Decimal:
+                s = Decimal("0")
+                for r in rows:
+                    if r[1] == kind:
+                        s += (r[2] or Decimal("0"))
+                return s
 
+            total_in = _sum("in")
+            total_out = _sum("out")
+            net = total_in - total_out
+
+            data = [
+                {
+                    "id": r[0],
+                    "type": r[1],
+                    "amount": float(r[2]) if r[2] is not None else 0.0,
+                    "currency": r[3],
+                    "category": r[4],
+                    "note": r[5],
+                    "created_at": _fmt_dt(str(r[6])),
+                }
+                for r in rows
+            ]
+
+            return JSONResponse({
+                "ok": True,
+                "totals": {
+                    "in": float(total_in),
+                    "out": float(total_out),
+                    "net": float(net),
+                    "currency": "CHF",
+                },
+                "rows": data
+            })
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "db_failed_dashboard", "detail": str(e)}, status_code=500)
+
+# ----------------------------- HTML della dashboard ----------------------------------
 @APP.get("/dashboard")
-async def dashboard(request: Request) -> HTMLResponse:
-    html = """<!DOCTYPE html>
+async def dashboard_page(request: Request) -> HTMLResponse:
+    logo_img = f"<img src='{LOGO_URL}' alt='logo' style='height:28px;margin-right:12px'/>" if LOGO_URL else ""
+    html = f"""<!doctype html>
 <html lang="it">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>FLAI · Dashboard</title>
 <style>
-  :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-  body  { margin:0; background:#0b0e0f; color:#e6e6e6; }
-  header{ padding:12px 20px; border-bottom:1px solid #0f1a22; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  .brand{ font-weight:700; letter-spacing:.3px; }
-  .bar   { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  input, select, button { background:#121a1f; color:#e6e6e6; border:1px solid #223d34; border-radius:8px; padding:8px 10px; }
-  button.btn { background:#0e4a6c; border-color:#0e4a6c; cursor:pointer; }
-  button.btn:hover { filter:brightness(1.1); }
-  main  { padding:18px; max-width:1100px; margin-inline:auto; }
-  .kpis { display:flex; gap:12px; flex-wrap:wrap; }
-  .card { background:#121a1f; border:1px solid #223d34; border-radius:12px; padding:14px; flex:1; min-width:220px; }
-  .muted{ color:#97a4ab; font-size:.9rem; }
-  table { width:100%; border-collapse:collapse; margin-top:14px; }
-  th,td { padding:10px; border-bottom:1px solid #1b262c; font-size:.95rem; }
-  tr:hover td { background:#10181d; }
-  .right{ text-align:right; }
-  .search{ flex:1; min-width:180px; }
-  a { color:#85bfe6; text-decoration:none; }
+:root {{
+  --brand: {BRAND_BLUE};
+  --accent: {ACCENT_GOLD};
+  --fg: #e6eef5;
+  --muted: #9aa4b2;
+  --panel: #121a24;
+  --panel-b: #1f2a36;
+  --ok: #3ddc97;
+  --bad: #ff6b6b;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:#0b0f14;color:var(--fg)}}
+header{{position:sticky;top:0;background:var(--brand);border-bottom:1px solid #16324a;padding:12px 16px;display:flex;gap:12px;align-items:center;z-index:2}}
+h1{{margin:0;font-size:16px;letter-spacing:.3px}}
+.controls input, .controls select{{background:#0f1a24;border:1px solid #203548;color:var(--fg);padding:8px 10px;border-radius:8px}}
+.btn{{background:var(--accent);color:#000;border:none;padding:8px 12px;border-radius:8px;font-weight:700;cursor:pointer}}
+.btn:disabled{{opacity:.6;cursor:not-allowed}}
+.container{{padding:18px}}
+.kpis{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px}}
+.card{{background:var(--panel);border:1px solid var(--panel-b);border-radius:12px;padding:14px}}
+.card h3{{margin:0 0 6px 0;font-weight:600;color:var(--muted);font-size:13px}}
+.card .v{{font-size:20px;font-weight:700}}
+table{{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--panel-b);border-radius:12px;overflow:hidden}}
+th,td{{padding:10px 12px;border-bottom:1px solid #253344;text-align:left}}
+th{{text-transform:uppercase;font-size:12px;letter-spacing:.4px;color:var(--muted)}}
+.badge{{display:inline-block;padding:2px 8px;border-radius:999px;font-weight:700;font-size:12px}}
+.badge.in{{background:#0b3d2e;color:#00d68f}}
+.badge.out{{background:#3b1b1b;color:#ff7b7b}}
+.topbar-right{{margin-left:auto;display:flex;gap:8px;align-items:center}}
+.search{{min-width:220px}}
+.logo-wrap{{display:flex;align-items:center;gap:8px;margin-right:6px}}
 </style>
 </head>
 <body>
-<header>
-  <div class="brand">FLAI · Dashboard</div>
-  <div class="bar">
-    <label>Dal <input id="from" type="date"></label>
-    <label>Al <input id="to" type="date"></label>
-    <select id="type">
-      <option value="">tutti i tipi</option>
-      <option value="in">entrate</option>
-      <option value="out">uscite</option>
-    </select>
-    <input id="category" placeholder="categoria (es. sales, fornitori)" />
-    <input id="q" class="search" placeholder="cerca testo (note, categoria)"/>
-    <button id="apply" class="btn">Applica filtri</button>
-    <button id="pdf" class="btn">Scarica PDF</button>
-  </div>
-</header>
-<main>
-  <div class="kpis">
-    <div class="card"><div class="muted">Entrate</div><div id="k_in"  style="font-size:1.3rem;margin-top:6px">–</div></div>
-    <div class="card"><div class="muted">Uscite</div><div id="k_out" style="font-size:1.3rem;margin-top:6px">–</div></div>
-    <div class="card"><div class="muted">Netto</div><div id="k_net" style="font-size:1.3rem;margin-top:6px">–</div></div>
-  </div>
+  <header>
+    <div class="logo-wrap">{logo_img}<h1>FLAI · Dashboard</h1></div>
+    <div class="controls">
+      Dal <input id="from" type="date">
+      Al <input id="to" type="date">
+      <select id="typ">
+        <option value="all">TUTTI I TIPI</option>
+        <option value="in">ENTRATE</option>
+        <option value="out">USCITE</option>
+      </select>
+      <input id="cat" placeholder="categoria (es. sales, fornitori)">
+      <input id="q" class="search" placeholder="cerca testo (note, categoria)">
+      <button id="apply" class="btn">Applica filtri</button>
+    </div>
+    <div class="topbar-right">
+      <a id="pdf" class="btn" href="#" download>Scarica PDF</a>
+    </div>
+  </header>
 
-  <div class="card" style="margin-top:14px;">
-    <div class="muted" style="margin-bottom:8px;">Movimenti</div>
-    <table id="tbl">
-      <thead>
-        <tr>
-          <th>id</th><th>tipo</th><th class="right">amount</th><th>currency</th><th>category</th><th>note</th><th>created_at</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-    <div id="empty" class="muted" style="display:none;margin-top:8px;">Nessun movimento per i filtri selezionati.</div>
+  <div class="container">
+    <div class="kpis">
+      <div class="card"><h3>Entrate</h3><div id="k_in" class="v">–</div></div>
+      <div class="card"><h3>Uscite</h3><div id="k_out" class="v">–</div></div>
+      <div class="card"><h3>Netto</h3><div id="k_net" class="v">–</div></div>
+    </div>
+
+    <div class="card" style="padding:0">
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th>id</th><th>tipo</th><th>amount</th><th>currency</th>
+            <th>category</th><th>note</th><th>created at</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
-</main>
 
 <script>
-function fmt(n){ try { return new Intl.NumberFormat('it-CH',{minimumFractionDigits:2,maximumFractionDigits:2}).format(n);}catch(e){return n;}}
-function todayISO(d){ const z=n=>String(n).padStart(2,'0'); return d.getFullYear()+'-'+z(d.getMonth()+1)+'-'+z(d.getDate()); }
-function setDefaults(){
-  const to=new Date(); const from=new Date(); from.setMonth(from.getMonth()-1);
-  document.getElementById('from').value=todayISO(from);
-  document.getElementById('to').value=todayISO(to);
-}
-async function loadData(){
-  const f = new URLSearchParams();
-  const v_from=document.getElementById('from').value;
-  const v_to=document.getElementById('to').value;
-  const v_type=document.getElementById('type').value;
-  const v_cat=document.getElementById('category').value;
-  const v_q=document.getElementById('q').value;
-  if(v_from) f.set('from',v_from);
-  if(v_to)   f.set('to',v_to);
-  if(v_type) f.set('type',v_type);
-  if(v_cat)  f.set('category',v_cat);
-  if(v_q)    f.set('q',v_q);
+function fmt(n){return new Intl.NumberFormat('it-CH',{{style:'decimal',minimumFractionDigits:2,maximumFractionDigits:2}}).format(n)}
+function qs(id){return document.getElementById(id)}
 
-  const resp = await fetch('/dashboard/data?'+f.toString());
-  if(!resp.ok){ alert('Errore nel caricamento dati ('+resp.status+')'); return; }
-  const js = await resp.json();
+function dateISO(d){return d.toISOString().slice(0,10)}
+// default: ultimo mese
+const today=new Date(); const fromDef=new Date(today); fromDef.setMonth(fromDef.getMonth()-1);
+qs('from').value = dateISO(fromDef);
+qs('to').value = dateISO(today);
 
-  document.getElementById('k_in').textContent  = fmt(js.totals.in)+' CHF';
-  document.getElementById('k_out').textContent = fmt(js.totals.out)+' CHF';
-  document.getElementById('k_net').textContent = fmt(js.totals.net)+' CHF';
+async function load(){
+  const params = new URLSearchParams()
+  if(qs('from').value) params.set('from', qs('from').value)
+  if(qs('to').value)   params.set('to', qs('to').value)
+  if(qs('typ').value)  params.set('typ', qs('typ').value)
+  if(qs('cat').value)  params.set('category', qs('cat').value)
+  if(qs('q').value)    params.set('q', qs('q').value)
 
-  const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
-  if(!js.rows.length){ document.getElementById('empty').style.display='block'; return; }
-  else{ document.getElementById('empty').style.display='none'; }
+  const url = '/dashboard_data?'+params.toString()
+  const r = await fetch(url, {{cache:'no-store'}})
+  if(!r.ok){{ alert('Errore nel caricamento dati ('+r.status+')'); return; }}
+  const j = await r.json()
+  if(!j.ok){{ alert('Errore: '+(j.error||'sconosciuto')); return; }}
 
-  js.rows.forEach(r=>{
-    const tr=document.createElement('tr');
-    tr.innerHTML =
-      `<td>${r.id}</td>`+
-      `<td>${r.type}</td>`+
-      `<td class="right">${fmt(r.amount)}</td>`+
-      `<td>${r.currency}</td>`+
-      `<td>${r.category}</td>`+
-      `<td>${r.note}</td>`+
-      `<td>${r.created_at}</td>`;
-    tb.appendChild(tr);
-  });
+  qs('k_in').textContent  = fmt(j.totals.in)+' CHF'
+  qs('k_out').textContent = fmt(j.totals.out)+' CHF'
+  qs('k_net').textContent = fmt(j.totals.net)+' CHF'
 
-  const pdfBtn=document.getElementById('pdf');
-  const p=new URLSearchParams();
-  if(v_from) p.set('from',v_from);
-  if(v_to)   p.set('to',v_to);
-  if(v_cat)  p.set('category',v_cat);
-  pdfBtn.onclick=()=>window.open('/reports/pdf?'+p.toString(),'_blank');
-}
-document.getElementById('apply').addEventListener('click', loadData);
-setDefaults(); loadData();
+  const tb = qs('tbl').querySelector('tbody'); tb.innerHTML=''
+  j.rows.forEach(r => {{
+    const tr = document.createElement('tr')
+    tr.innerHTML = `
+      <td>${{r.id}}</td>
+      <td><span class="badge ${{r.type}}">${{r.type}}</span></td>
+      <td>${{fmt(r.amount)}}</td>
+      <td>${{r.currency||''}}</td>
+      <td>${{r.category||''}}</td>
+      <td>${{r.note||''}}</td>
+      <td>${{r.created_at}}</td>`
+    tb.appendChild(tr)
+  }})
+
+  // link "Scarica PDF"
+  const pdf = document.getElementById('pdf')
+  const p2 = new URLSearchParams(params)
+  pdf.href = '/reports/pdf?'+p2.toString()
+}}
+
+document.getElementById('apply').addEventListener('click',load)
+window.addEventListener('DOMContentLoaded',load)
 </script>
-</body></html>"""
-    return HTMLResponse(html)
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+# ----------------------------- Export PDF (riusa i filtri) -----------------------------
+@APP.get("/reports/pdf")
+async def report_pdf(
+    request: Request,
+    frm: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = Query(None, alias="to"),
+    category: Optional[str] = None,
+    typ: str = Query("all", pattern="^(all|in|out)$"),
+):
+    # recupera i dati dalla stessa API
+    params = {"from": frm, "to": to, "category": category, "typ": typ}
+    q = "&".join([f"{k}={v}" for k,v in params.items() if v])
+    # contenuto semplice (riassunto + tabella) – poi potrai raffinarlo
+    try:
+        # Genera un PDF minimale con reportlab se installato, altrimenti txt
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import mm
+
+        # chiama /dashboard_data internamente
+        scope = {"type": "http", "method":"GET", "path":"/dashboard_data", "query_string": q.encode()}
+        from starlette.testclient import TestClient
+        with TestClient(APP) as client:
+            r = client.get("/dashboard_data?"+q)
+            data = r.json()
+
+        buff = io.BytesIO()
+        c = canvas.Canvas(buff, pagesize=A4)
+        w, h = A4
+        y = h - 25*mm
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(20*mm, y, "FLAI – Report")
+        y -= 10*mm
+        c.setFont("Helvetica", 10)
+        c.drawString(20*mm, y, f"Entrate: {data['totals']['in']:.2f}  |  Uscite: {data['totals']['out']:.2f}  |  Netto: {data['totals']['net']:.2f}")
+        y -= 8*mm
+        c.drawString(20*mm, y, f"Filtri: from={frm or '-'} to={to or '-'} typ={typ} cat={category or '-'}")
+        y -= 10*mm
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(20*mm, y, "ID  TIPO   IMPORTO   CURR  CATEGORIA               NOTE                 DATA")
+        y -= 6*mm
+        c.setFont("Helvetica", 9)
+        for r in data["rows"][:50]:
+            line = f"{r['id']:>3}  {r['type']:<3}  {r['amount']:>9.2f}  {r['currency'] or '':<4}  {(r['category'] or ''):<20.20}  {(r['note'] or ''):<20.20}  {r['created_at']}"
+            c.drawString(20*mm, y, line)
+            y -= 5.2*mm
+            if y < 20*mm:
+                c.showPage(); y = h - 20*mm; c.setFont("Helvetica", 9)
+        c.save()
+        buff.seek(0)
+        return StreamingResponse(buff, media_type="application/pdf",
+                                 headers={"Content-Disposition":"attachment; filename=flai_report.pdf"})
+    except Exception:
+        # fallback: txt se reportlab non è disponibile
+        lines = [
+            "FLAI – Report",
+            f"Entrate={params.get('from')}  Uscite={params.get('to')}  typ={typ}  cat={category}",
+            "(Installa reportlab per il PDF completo)"
+        ]
+        buff = io.BytesIO(("\n".join(lines)).encode("utf-8"))
+        return StreamingResponse(buff, media_type="text/plain",
+                                 headers={"Content-Disposition":"attachment; filename=flai_report.txt"})
