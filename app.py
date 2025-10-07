@@ -899,79 +899,43 @@ async def email_report(
 # === FINE EMAIL ===============================================================
 
 
-# ============================ DASHBOARD (HTML + API + PDF) ============================
-# Import dedicati dashboard
-import os
-import io
-import base64
-from datetime import date as _date, datetime, timezone
-from decimal import Decimal
-from typing import Dict, List, Optional
+# ==============================================================
+# DASHBOARD (HTML + API dati) — filtri, tabella, export PDF
+# ==============================================================
 
-from fastapi import Request, HTTPException
+import os, io, json, base64, datetime as dt
+from typing import Optional, List, Dict, Any
+from decimal import Decimal
+
+from fastapi import Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-# ---- Brand & logo da ENV (con default) ----
-BRAND_BLUE = os.getenv("BRAND_BLUE", "#0b2a44")
-ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#c6a542")
-LOGO_URL = os.getenv("LOGO_URL", "").strip()
+# ---- Brand (personalizzabile via ENV) ----
+BRAND_BLUE = os.getenv("BRAND_BLUE", "#000A22")   # blu del brand
+ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#AA8F15") # oro accent
+LOGO_URL = os.getenv("LOGO_URL", "")              # logo PNG/JPG/SVG
 
-# ---- Basic Auth per /dashboard ----
-DASH_USER = os.getenv("DASHBOARD_USER") or os.getenv("DASH_USER") or ""
-DASH_PASS = os.getenv("DASHBOARD_PASSWORD") or os.getenv("DASH_PASS") or ""
-
-def _need_auth(request: Request) -> bool:
-    p = request.url.path
-    # Proteggiamo la dashboard (HTML e API) e il PDF
-    protected = (p.startswith("/dashboard") or p.startswith("/reports/pdf"))
-    return protected
-
-def _check_basic_auth(request: Request) -> bool:
-    if not DASH_USER or not DASH_PASS:
-        # Se non configurato, non blocchiamo (comodo in dev)
-        return True
-    auth = request.headers.get("authorization", "")
-    if not auth.lower().startswith("basic "):
-        return False
+# ---- Helpers per la dashboard ----
+def _iso_or_none(s: Optional[str]) -> Optional[dt.date]:
+    if not s:
+        return None
     try:
-        user, pwd = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8").split(":", 1)
-        return (user == DASH_USER and pwd == DASH_PASS)
-    except Exception:
-        return False
-
-@APP.middleware("http")
-async def _protect_dashboard(request: Request, call_next):
-    # NB: mantieni il TUO middleware di rate-limit/sicurezza già esistente sopra.
-    if _need_auth(request) and not _check_basic_auth(request):
-        return HTMLResponse(
-            "Auth required",
-            status_code=401,
-            headers={"WWW-Authenticate": 'Basic realm="FLAI Dashboard"'}
-        )
-    return await call_next(request)
-
-# ---------- UTIL ---------
-def _iso_or_none(s: Optional[str]) -> Optional[_date]:
-    try:
-        return _date.fromisoformat(s) if s and s.strip() else None
+        return dt.date.fromisoformat(s)
     except Exception:
         return None
 
 def _like_or_none(s: Optional[str]) -> Optional[str]:
     return f"%{s.strip()}%" if s and s.strip() else None
 
-def _fmt_dt_hhmm(dt: datetime) -> str:
-    # Mostra timestamp leggibile (senza millisecondi)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
-
-def _fetch_rows(conn, d_from: Optional[_date], d_to: Optional[_date], typ: Optional[str],
-                q: Optional[str], limit: int = 500) -> List[Dict]:
+def _fetch_rows_and_totals(conn, d_from: Optional[dt.date], d_to: Optional[dt.date],
+                           typ: str, q: Optional[str]) -> Dict[str, Any]:
+    # rows
     sql = """
-        SELECT id, type, amount::numeric(14,2), currency, category, COALESCE(note,''), created_at
+        SELECT id, type, amount::numeric(14,2), currency, category, COALESCE(note,'') AS note, created_at
         FROM movements
         WHERE 1=1
     """
-    params: List = []
+    params: List[Any] = []
     if d_from:
         sql += " AND created_at::date >= %s"
         params.append(d_from)
@@ -982,328 +946,259 @@ def _fetch_rows(conn, d_from: Optional[_date], d_to: Optional[_date], typ: Optio
         sql += " AND type = %s"
         params.append(typ)
     if q:
-        sql += """
-        AND (
-            CAST(id AS TEXT) ILIKE %s
-            OR type ILIKE %s
-            OR CAST(amount AS TEXT) ILIKE %s
-            OR currency ILIKE %s
-            OR category ILIKE %s
-            OR note ILIKE %s
-            OR TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') ILIKE %s
-        )
-        """
-        for _ in range(7):
-            params.append(q)
+        sql += " AND (CAST(id AS TEXT) ILIKE %s OR type ILIKE %s OR currency ILIKE %s OR category ILIKE %s OR note ILIKE %s)"
+        like = _like_or_none(q)
+        params.extend([like, like, like, like, like])
+    sql += " ORDER BY created_at DESC LIMIT 500"
 
-    sql += " ORDER BY created_at DESC LIMIT %s"
-    params.append(limit)
+    # totals
+    tsql = """
+        SELECT
+            COALESCE(SUM(CASE WHEN type='in'  THEN amount ELSE 0 END),0)::numeric(14,2) AS tin,
+            COALESCE(SUM(CASE WHEN type='out' THEN amount ELSE 0 END),0)::numeric(14,2) AS tout
+        FROM movements
+        WHERE 1=1
+    """
+    tparams = []
+    if d_from:
+        tsql += " AND created_at::date >= %s"
+        tparams.append(d_from)
+    if d_to:
+        tsql += " AND created_at::date <= %s"
+        tparams.append(d_to)
+    if typ in ("in", "out"):
+        tsql += " AND type = %s"
+        tparams.append(typ)
+    if q:
+        tsql += " AND (CAST(id AS TEXT) ILIKE %s OR type ILIKE %s OR currency ILIKE %s OR category ILIKE %s OR note ILIKE %s)"
+        like = _like_or_none(q)
+        tparams.extend([like, like, like, like, like])
 
-    rows = []
-    with conn.cursor() as c:
-        c.execute(sql, params)
-        for r in c.fetchall():
-            rid, rtype, amount, curr, cat, note, created = r
-            rows.append({
-                "id": rid,
-                "type": rtype,
-                "amount": float(amount) if isinstance(amount, Decimal) else amount,
-                "currency": curr,
-                "category": cat,
-                "note": note,
-                "created_at": _fmt_dt_hhmm(created),
-            })
-    return rows
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.execute(tsql, tparams)
+        tin, tout = cur.fetchone()
 
-def _sum_in_out(rows: List[Dict]) -> Dict[str, float]:
-    _in = sum(r["amount"] for r in rows if r["type"] == "in")
-    _out = sum(r["amount"] for r in rows if r["type"] == "out")
-    return {"in": round(_in, 2), "out": round(_out, 2), "net": round(_in - _out, 2)}
+    # normalizza righe per JSON
+    out_rows = []
+    for r in rows:
+        rid, rtype, amount, currency, category, note, created_at = r
+        out_rows.append({
+            "id": rid,
+            "type": rtype,
+            "amount": float(amount),
+            "currency": currency,
+            "category": category,
+            "note": note,
+            "created_at": created_at.isoformat()
+        })
 
-# ---------- API DATI (JSON) ----------
+    return {"rows": out_rows, "in_total": float(tin), "out_total": float(tout)}
+
+# ---- API dati per la dashboard ----
 @APP.get("/dashboard/data")
-async def dashboard_data(request: Request,
-                         dfrom: Optional[str] = None,
-                         dto: Optional[str] = None,
-                         typ: Optional[str] = None,
-                         q: Optional[str] = None):
-    d_from = _iso_or_none(dfrom)
-    d_to = _iso_or_none(dto)
-    # normalizza typ: all/in/out
-    typ = (typ or "").strip()
-    if typ not in ("", "in", "out", "all"):
-        typ = ""
-    if typ == "all":
-        typ = ""
-    q_like = _like_or_none(q)
+async def dashboard_data(
+    request: Request,
+    from_: Optional[str] = Query(default=None, alias="from"),
+    to: Optional[str] = None,
+    type: str = "all",             # all | in | out
+    q: Optional[str] = None
+):
+    d_from = _iso_or_none(from_)
+    d_to   = _iso_or_none(to)
+    if type not in ("all", "in", "out"):
+        raise HTTPException(400, "invalid type")
+    try:
+        data = _fetch_rows_and_totals(get_conn(), d_from, d_to, type, q)
+        return JSONResponse({"ok": True, **data})
+    except Exception as e:
+        # log minimale
+        return JSONResponse({"ok": False, "error": "db_failed", "detail": str(e)}, status_code=500)
 
-    with get_conn() as conn:  # usa la tua get_conn esistente
-        rows = _fetch_rows(conn, d_from, d_to, typ, q_like, limit=1000)
-    sums = _sum_in_out(rows)
-    return JSONResponse({"ok": True, "rows": rows, "sums": sums})
-
-# ---------- HTML ----------
+# ---- HTML Dashboard ----
 @APP.get("/dashboard")
 async def dashboard(request: Request) -> HTMLResponse:
-    # default intervallo: ultimo mese
-    today = _date.today()
-    first = today.replace(day=1)
-    html = f"""<!DOCTYPE html>
+    # ATT: uso triple-quoted string con DOPPIE parentesi per evitare problemi con f-string/JS
+    html = f"""
+<!doctype html>
 <html lang="it">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>FLAI · Dashboard</title>
 <style>
-  :root {{
-    --brand: {BRAND_BLUE};
-    --accent: {ACCENT_GOLD};
-    --bg: #0d1117;
-    --card: #161b22;
-    --text: #e6edf3;
-    --muted: #9aa4b2;
-    --ok: #2ea043;
-    --warn: #f0b429;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin:0; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
-  }}
-  header {{
-    background: var(--brand);
-    display:flex; align-items:center; gap:14px;
-    padding:10px 16px; border-bottom:1px solid #0b1320;
-  }}
-  .logo {{
-    width:36px; height:36px; border-radius:6px;
-    background: url('{LOGO_URL}') center/cover no-repeat;
-    flex:0 0 36px;
-  }}
-  .title {{ font-weight:700; letter-spacing:.3px; }}
-  main {{ padding:18px; max-width:1100px; margin:0 auto; }}
-  .toolbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:14px; }}
-  .toolbar input[type="date"],
-  .toolbar select,
-  .toolbar input[type="text"] {{
-    background:#0f1624; color:var(--text); border:1px solid #22314d; border-radius:8px; padding:8px 10px;
-  }}
-  .btn {{
-    background: var(--accent); border:none; color:#111; font-weight:700;
-    border-radius:8px; padding:8px 12px; cursor:pointer;
-  }}
-  .kpis {{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap:12px; margin-bottom:12px; }}
-  .card {{ background:var(--card); border:1px solid #1f2633; border-radius:10px; padding:12px 14px; }}
-  .label {{ font-size:12px; color:var(--muted); margin-bottom:8px; }}
-  .value {{ font-size:20px; font-weight:800; }}
-  .table {{ background:var(--card); border:1px solid #1f2633; border-radius:10px; overflow:auto; }}
-  table {{ width:100%; border-collapse:collapse; }}
-  th, td {{ padding:10px 12px; border-bottom:1px solid #222a36; text-align:left; white-space:nowrap; }}
-  th {{ font-size:12px; letter-spacing:.5px; color:#b9c2cf; }}
-  .right {{ text-align:right; }}
-  .muted {{ color:var(--muted); }}
-  .brandbar {{ height:8px; background:var(--brand); }}
+:root {{
+  --brand-blue: {BRAND_BLUE};
+  --accent-gold: {ACCENT_GOLD};
+  --bg: #0f141b; --panel:#1c2430; --text:#e8eef6; --muted:#9aa4b2; --ok:#a8ffb0;
+  --radius:12px;
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
+
+.header {{
+  background: var(--brand-blue);
+  padding: 8px 16px;
+  display: flex; align-items: center; gap: 12px;
+}}
+.brand {{ display:flex; align-items:center; gap:10px; }}
+.brand img {{
+  height: 28px; width: 28px; object-fit: contain;
+  /* workaround per rendere il logo leggermente più scuro come lo sfondo */
+  filter: brightness(0.92) saturate(1.05);
+}}
+.brand-name {{ font-weight: 700; letter-spacing: .3px; }}
+
+.toolbar {{
+  margin: 10px 16px 0 16px;
+  display:flex; align-items:center; gap:10px;
+}}
+.toolbar .grow {{ flex:1; }}
+input, select {{ background:#0f141b; color:var(--text); border:1px solid #2a3a4d; border-radius:8px; padding:8px 10px; }}
+button.btn {{ background: var(--accent-gold); color:#111; border:none; padding:8px 12px; border-radius:10px; font-weight:600; cursor:pointer; }}
+button.btn:active {{ transform: translateY(1px); }}
+
+.kpis {{ display:flex; gap:16px; margin:12px 16px; }}
+.card {{ background:var(--panel); border:1px solid #2a3a4d; border-radius:var(--radius); padding:14px 16px; flex:1; }}
+.card h4 {{ margin:0 0 8px 0; font-size:12px; font-weight:700; color:var(--muted); letter-spacing:.6px; }}
+.card .value {{ font-size:18px; font-weight:800; }}
+
+.table-wrap {{ background:var(--panel); border:1px solid #2a3a4d; border-radius:var(--radius); margin:0 16px 30px 16px; overflow:auto; }}
+table {{ width:100%; border-collapse: collapse; table-layout: fixed; }}
+th, td {{ padding:10px 12px; border-bottom:1px solid #2a3a4d; text-align:left; }}
+th {{ color:var(--muted); font-size:12px; letter-spacing:.6px; }}
+th:nth-child(1) {{ width:64px; }}
+th:nth-child(2) {{ width:88px; }}
+th:nth-child(3) {{ width:120px; }} /* AMOUNT allineato */
+th:nth-child(4) {{ width:96px; }}
+td.amount {{ font-variant-numeric: tabular-nums; text-align:right; }}
+td.created {{ white-space: nowrap; }}
+
+.badge {{ background:#0f141b; border:1px solid #2a3a4d; color:var(--text); padding:6px 10px; border-radius:8px; font-size:12px; }}
+.right {{ display:flex; align-items:center; gap:10px; justify-content:flex-end; }}
 </style>
 </head>
 <body>
-  <header>
-    <div class="logo" title="FLAI"></div>
-    <div class="title">FLAI · Dashboard</div>
-  </header>
-  <div class="brandbar"></div>
-  <main>
-    <div class="toolbar">
-      <span class="muted">Dal</span>
-      <input id="from" type="date" value="{first.isoformat()}"/>
-      <span class="muted">al</span>
-      <input id="to" type="date" value="{today.isoformat()}"/>
-
-      <select id="typ">
-        <option value="">TUTTI I TIPI</option>
-        <option value="in">ENTRATE</option>
-        <option value="out">USCITE</option>
-      </select>
-
-      <input id="q" type="text" placeholder="cerca testo (id, tipo, amount, currency, category, note, data)"/>
-
-      <button class="btn" onclick="applyFilters()">Applica filtri</button>
-      <button class="btn" onclick="downloadPdf()">Scarica PDF</button>
-    </div>
-
-    <div class="kpis">
-      <div class="card">
-        <div class="label">ENTRATE</div>
-        <div class="value" id="k_in">–</div>
+  <div class="header">
+    <div class="brand">
+      <div style="height:28px;width:28px;border-radius:6px;background:var(--brand-blue);display:grid;place-items:center;">
+        {"<img src='"+LOGO_URL+"' alt='logo'/>" if LOGO_URL else ""}
       </div>
-      <div class="card">
-        <div class="label">USCITE</div>
-        <div class="value" id="k_out">–</div>
-      </div>
-      <div class="card">
-        <div class="label">NETTO</div>
-        <div class="value" id="k_net">–</div>
-      </div>
+      <div class="brand-name">FLAI · Dashboard</div>
     </div>
+  </div>
 
-    <div class="table">
-      <table id="tbl">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>TIPO</th>
-            <th class="right">AMOUNT</th>
-            <th>CURRENCY</th>
-            <th>CATEGORY</th>
-            <th>NOTE</th>
-            <th>CREATED AT</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+  <div class="toolbar">
+    <label>Dal</label><input type="date" id="from">
+    <label>al</label><input type="date" id="to">
+    <select id="typ">
+      <option value="all">TUTTI I TIPI</option>
+      <option value="in">SOLO ENTRATE</option>
+      <option value="out">SOLO USCITE</option>
+    </select>
+    <input id="q" placeholder="cerca testo (id, tipo, amount, note, categoria)" style="min-width:260px;">
+    <button class="btn" id="apply">Applica filtri</button>
+    <div class="grow"></div>
+    <div class="right">
+      <button class="btn" id="pdf">Scarica PDF</button>
     </div>
-  </main>
+  </div>
+
+  <div class="kpis">
+    <div class="card"><h4>ENTRATE</h4><div class="value" id="v_in">0.00 CHF</div></div>
+    <div class="card"><h4>USCITE</h4><div class="value" id="v_out">0.00 CHF</div></div>
+    <div class="card"><h4>NETTO</h4><div class="value" id="v_net">0.00 CHF</div></div>
+  </div>
+
+  <div class="table-wrap">
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th>ID</th><th>TIPO</th><th>AMOUNT</th><th>CURRENCY</th><th>CATEGORY</th><th>NOTE</th><th>CREATED AT</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
 
 <script>
-// formattazione importi (locale CH/IT), 2 decimali
-function fmtMoney(n){{ return new Intl.NumberFormat('it-CH', {{style:'decimal', minimumFractionDigits:2, maximumFractionDigits:2}}).format(n); }}
+(function() {{
+  const fmtMoney = new Intl.NumberFormat('it-CH', {{style:'decimal', minimumFractionDigits:2, maximumFractionDigits:2}});
+  function CHF(n) {{ return fmtMoney.format(n) + " CHF"; }}
 
-function qs(id){{ return document.getElementById(id); }}
+  const elFrom = document.getElementById('from');
+  const elTo   = document.getElementById('to');
+  const elTyp  = document.getElementById('typ');
+  const elQ    = document.getElementById('q');
+  const elApply= document.getElementById('apply');
+  const elPDF  = document.getElementById('pdf');
+  const tb     = document.querySelector('#tbl tbody');
 
-async function loadData() {{
-  const from = qs('from').value;
-  const to = qs('to').value;
-  const typ = qs('typ').value;
-  const q = qs('q').value;
+  // default: ultimo mese
+  const today = new Date();
+  const fromD = new Date(today); fromD.setMonth(fromD.getMonth()-1);
+  elFrom.value = fromD.toISOString().slice(0,10);
+  elTo.value   = today.toISOString().slice(0,10);
 
-  const url = new URL('/dashboard/data', window.location.origin);
-  if (from) url.searchParams.set('dfrom', from);
-  if (to) url.searchParams.set('dto', to);
-  if (typ) url.searchParams.set('typ', typ);
-  if (q) url.searchParams.set('q', q);
+  async function load() {{
+    const params = new URLSearchParams();
+    if (elFrom.value) params.set('from', elFrom.value);
+    if (elTo.value)   params.set('to', elTo.value);
+    if (elTyp.value !== 'all') params.set('type', elTyp.value);
+    if (elQ.value.trim()) params.set('q', elQ.value.trim());
 
-  const res = await fetch(url, {{headers: {{'Accept':'application/json'}}}});
-  if (!res.ok) {{
-    alert('Errore nel caricamento dati ('+res.status+')');
-    return;
+    const r = await fetch('/dashboard/data?' + params.toString(), {{ headers: {{ 'X-API-Key': '{os.getenv("API_KEY_APP","")}' }} }});
+    if (!r.ok) {{
+      alert('Errore nel caricamento dati (' + r.status + ')');
+      return;
+    }}
+    const j = await r.json();
+    if (!j.ok) {{
+      alert('Errore: ' + (j.error || 'unknown'));
+      return;
+    }}
+
+    // kpi
+    document.getElementById('v_in').textContent  = CHF(j.in_total);
+    document.getElementById('v_out').textContent = CHF(j.out_total);
+    document.getElementById('v_net').textContent = CHF(j.in_total - j.out_total);
+
+    // table
+    tb.innerHTML = '';
+    for (const row of j.rows) {{
+      const tr = document.createElement('tr');
+      const d  = new Date(row.created_at);
+      const nice = d.toLocaleDateString('it-CH') + ' ' + d.toLocaleTimeString('it-CH', {{hour:'2-digit', minute:'2-digit'}});
+
+      tr.innerHTML = `
+        <td>${{row.id}}</td>
+        <td>${{row.type}}</td>
+        <td class="amount">${{fmtMoney.format(row.amount)}}</td>
+        <td>${{row.currency}}</td>
+        <td>${{row.category || ''}}</td>
+        <td>${{row.note || ''}}</td>
+        <td class="created">${{nice}}</td>
+      `;
+      tb.appendChild(tr);
+    }}
   }}
-  const data = await res.json();
-  render(data);
-}}
 
-function render(data) {{
-  const sums = data.sums || {{in:0,out:0,net:0}};
-  qs('k_in').textContent  = fmtMoney(sums.in)  + ' CHF';
-  qs('k_out').textContent = fmtMoney(sums.out) + ' CHF';
-  qs('k_net').textContent = fmtMoney(sums.net) + ' CHF';
+  elApply.addEventListener('click', load);
+  document.addEventListener('keydown', (e)=>{{ if (e.key === 'Enter') load(); }});
+  elPDF.addEventListener('click', ()=>{{
+    const params = new URLSearchParams();
+    if (elFrom.value) params.set('from', elFrom.value);
+    if (elTo.value)   params.set('to', elTo.value);
+    if (elTyp.value !== 'all') params.set('type', elTyp.value);
+    if (elQ.value.trim()) params.set('q', elQ.value.trim());
+    window.location.href = '/reports/pdf?' + params.toString();
+  }});
 
-  const tb = document.querySelector('#tbl tbody');
-  tb.innerHTML = '';
-  for (const r of (data.rows || [])) {{
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${{r.id}}</td>
-      <td>${{r.type}}</td>
-      <td class="right">${{fmtMoney(r.amount)}} CHF</td>
-      <td>${{r.currency}}</td>
-      <td>${{r.category}}</td>
-      <td>${{r.note}}</td>
-      <td>${{r.created_at}}</td>
-    `;
-    tb.appendChild(tr);
-  }}
-}}
-
-function applyFilters() {{ loadData(); }}
-
-function downloadPdf() {{
-  const from = qs('from').value;
-  const to = qs('to').value;
-  const typ = qs('typ').value;
-  const q = qs('q').value;
-
-  const url = new URL('/reports/pdf', window.location.origin);
-  if (from) url.searchParams.set('from', from);
-  if (to) url.searchParams.set('to', to);
-  if (typ) url.searchParams.set('type', typ);
-  if (q) url.searchParams.set('q', q);
-  window.open(url, '_blank');
-}}
-
-loadData(); // carica subito con default
+  load();
+}})();
 </script>
 </body>
 </html>
 """
     return HTMLResponse(content=html)
-
-# ---------- PDF ----------
-@APP.get("/reports/pdf")
-async def reports_pdf(request: Request,
-                      from_: Optional[str] = None,
-                      to: Optional[str] = None,
-                      type: Optional[str] = None,
-                      q: Optional[str] = None):
-    d_from = _iso_or_none(from_)
-    d_to = _iso_or_none(to)
-    typ = (type or "").strip()
-    if typ not in ("", "in", "out", "all"):
-        typ = ""
-    if typ == "all":
-        typ = ""
-    q_like = _like_or_none(q)
-
-    with get_conn() as conn:
-        rows = _fetch_rows(conn, d_from, d_to, typ, q_like, limit=5000)
-    sums = _sum_in_out(rows)
-
-    # Tenta PDF con reportlab; fallback a txt
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.units import mm
-
-        buff = io.BytesIO()
-        c = canvas.Canvas(buff, pagesize=A4)
-        width, height = A4
-        y = height - 20*mm
-
-        def line(s: str):
-            nonlocal y
-            c.drawString(15*mm, y, s)
-            y -= 6*mm
-            if y < 20*mm:
-                c.showPage()
-                y = height - 20*mm
-
-        title = "FLAI · Report"
-        if d_from: title += f" {d_from.isoformat()}"
-        if d_to:   title += f" → {d_to.isoformat()}"
-        line(title)
-        line(f"Entrate: {sums['in']:.2f} CHF  |  Uscite: {sums['out']:.2f} CHF  |  Netto: {sums['net']:.2f} CHF")
-        line(" ")
-        line("ID  TIPO  IMPORTO  VALUTA  CATEGORIA  NOTE  DATA")
-        for r in rows[:500]:
-            line(f"{r['id']:>3}  {r['type']:>3}  {r['amount']:>8.2f}  {r['currency']:>3}  {r['category'][:12]:<12}  {r['note'][:16]:<16}  {r['created_at']}")
-
-        c.save()
-        buff.seek(0)
-        fname = f"flai-report_{(d_from or _date.today()).isoformat()}_{(d_to or _date.today()).isoformat()}.pdf"
-        return StreamingResponse(buff, media_type="application/pdf",
-                                 headers={"Content-Disposition": f'inline; filename="{fname}"'})
-    except Exception:
-        # fallback .txt se reportlab non presente
-        lines = []
-        title = "FLAI · Report"
-        if d_from: title += f" {d_from.isoformat()}"
-        if d_to:   title += f" -> {d_to.isoformat()}"
-        lines.append(title)
-        lines.append(f"Entrate: {sums['in']:.2f} CHF  |  Uscite: {sums['out']:.2f} CHF  |  Netto: {sums['net']:.2f} CHF")
-        lines.append("")
-        lines.append("ID;TIPO;IMPORTO;VALUTA;CATEGORIA;NOTE;DATA")
-        for r in rows:
-            lines.append(f"{r['id']};{r['type']};{r['amount']:.2f};{r['currency']};{r['category']};{r['note']};{r['created_at']}")
-        buff = io.BytesIO(("\n".join(lines)).encode("utf-8"))
-        buff.seek(0)
-        return StreamingResponse(buff, media_type="text/plain",
-                                 headers={"Content-Disposition": 'inline; filename="flai_report.txt"'})
-# ========================== FINE DASHBOARD ==========================
-
