@@ -1064,7 +1064,7 @@ async def dashboard_data(
 @APP.get("/dashboard")
 async def dashboard_page(request: Request) -> HTMLResponse:
     logo_img = f"<img src='{LOGO_URL}' alt='logo' style='height:28px;margin-right:12px'/>" if LOGO_URL else ""
-    html = f"""<!doctype html>
+    html = """<!doctype html>
 <html lang="it">
 <head>
 <meta charset="utf-8"/>
