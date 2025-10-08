@@ -910,7 +910,7 @@ BRAND_BLUE = os.getenv("BRAND_BLUE", "#000A22")
 ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#AA8F15")
 LOGO_URL    = os.getenv("LOGO_URL", "").strip()
 
-# usa get_conn() esistente se già definito nel file
+# usa get_conn() esistente
 try:
     get_conn  # type: ignore
 except NameError:
@@ -931,41 +931,31 @@ def _like(s: str | None) -> str | None:
 
 def _fetch_dashboard_rows(conn, d_from, d_to, typ, q, limit=100000):
     sql = """
-        SELECT id, type, amount::numeric(14,2) AS amount, currency, category,
-               COALESCE(note,'') AS note, created_at
+        SELECT id, type, amount::numeric(14,2) AS amount, currency,
+               COALESCE(category,'') AS category, COALESCE(note,'') AS note, created_at
         FROM movements
         WHERE 1=1
     """
     params = []
     if d_from:
-        sql += " AND created_at::date >= %s"
-        params.append(d_from)
+        sql += " AND created_at::date >= %s"; params.append(d_from)
     if d_to:
-        sql += " AND created_at::date <= %s"
-        params.append(d_to)
+        sql += " AND created_at::date <= %s"; params.append(d_to)
     if typ in ("in","out"):
-        sql += " AND type = %s"
-        params.append(typ)
+        sql += " AND type = %s"; params.append(typ)
     if q:
+        like = _like(q)
         sql += """ AND (
-            CAST(id AS TEXT) ILIKE %s OR
-            type ILIKE %s OR
-            CAST(amount AS TEXT) ILIKE %s OR
-            currency ILIKE %s OR
-            category ILIKE %s OR
-            note ILIKE %s OR
+            CAST(id AS TEXT) ILIKE %s OR type ILIKE %s OR
+            CAST(amount AS TEXT) ILIKE %s OR currency ILIKE %s OR
+            category ILIKE %s OR note ILIKE %s OR
             TO_CHAR(created_at,'YYYY-MM-DD HH24:MI') ILIKE %s
         )"""
-        like = _like(q)
         params += [like]*7
-
-    sql += " ORDER BY created_at DESC, id DESC"
-    sql += " LIMIT %s"
+    sql += " ORDER BY created_at DESC, id DESC LIMIT %s"
     params.append(limit)
-
     with conn.cursor() as c:
-        c.execute(sql, params)
-        return c.fetchall()
+        c.execute(sql, params); return c.fetchall()
 
 @APP.get("/dashboard", response_class=HTMLResponse)  # type: ignore
 async def dashboard(request: Request) -> HTMLResponse:
@@ -986,15 +976,15 @@ body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.35 -apple-syst
 .title{{font-weight:700;letter-spacing:.3px}}
 .wrap{{max-width:1280px;margin:18px auto;padding:0 16px}}
 
-.filters{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:14px 0}}
+.filters{{display:grid;grid-template-columns:auto auto auto 1fr auto auto;gap:10px;align-items:center}}
 label{{color:var(--muted);font-size:12px;margin-right:6px}}
 input[type=date],select,input[type=text]{{background:var(--panel);color:var(--text);border:1px solid #324158;border-radius:12px;padding:10px 12px}}
-input[type=text]{{width:240px}} /* accorciata per far stare i bottoni in riga */
 select.pill{{appearance:none;padding-right:28px;border-radius:12px}}
+input#q{{width:260px}} /* barra più corta per tenere tutto in una riga */
 .btn{{background:var(--accent);color:#111;border:0;border-radius:12px;padding:10px 12px;font-weight:700;cursor:pointer}}
 .btn:active{{transform:translateY(1px)}}
 
-.stats{{display:flex;gap:14px;margin:12px 0 16px}}
+.stats{{display:flex;gap:14px;margin:14px 0 16px}}
 .card{{flex:1;background:var(--panel2);border:1px solid #2f3b4c;border-radius:12px;padding:18px}}
 .card h4{{margin:0 0 6px;color:#b9c2cf;font-weight:600;font-size:12px;letter-spacing:.5px}}
 .card .v{{font-size:20px;font-weight:800}}
@@ -1004,7 +994,6 @@ table{{width:100%;border-collapse:collapse}}
 th,td{{padding:12px 14px;text-align:left;border-bottom:1px solid #2b3545;white-space:nowrap}}
 thead th{{color:#b9c2cf;font-size:12px;letter-spacing:.4px}}
 tbody tr:hover{{background:#1f2732}}
-/* larghezze come prima */
 th.col-id,td.col-id{{width:60px}}
 th.col-type,td.col-type{{width:80px}}
 th.col-amt,td.col-amt{{width:120px;text-align:right}}
@@ -1012,7 +1001,6 @@ th.col-cur,td.col-cur{{width:80px}}
 th.col-cat,td.col-cat{{width:180px}}
 th.col-note,td.col-note{{width:260px;overflow:hidden;text-overflow:ellipsis}}
 th.col-date,td.col-date{{width:160px}}
-small.muted{{color:var(--muted)}}
 </style></head>
 <body>
   <div class="header">
@@ -1030,7 +1018,8 @@ small.muted{{color:var(--muted)}}
         <option value="in">Entrate</option>
         <option value="out">Uscite</option>
       </select>
-      <input id="q" type="text" placeholder="Ricerca unica (id, tipo, amount, note, categoria)">
+      <label>Barra di ricerca</label>
+      <input id="q" type="text" placeholder="Barra di ricerca (id, tipo, amount, note, category)">
       <button id="apply" class="btn">Applica filtri</button>
       <button id="pdf" class="btn">Scarica PDF</button>
     </div>
@@ -1055,7 +1044,6 @@ small.muted{{color:var(--muted)}}
         <tbody></tbody>
       </table>
     </div>
-    <p><small class="muted">Suggerimento: lascia vuoti “Dal/Al” per vedere **tutto**.</small></p>
   </div>
 
 <script>
@@ -1097,22 +1085,23 @@ async function loadData() {{
   for (const r of js.rows) {{
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td class="col-id">\${{r.id}}</td>
-      <td class="col-type">\${{r.type}}</td>
-      <td class="col-amt" style="text-align:right">\${{money(r.amount)}}</td>
-      <td class="col-cur">\${{r.currency}}</td>
-      <td class="col-cat">\${{r.category ?? ''}}</td>
-      <td class="col-note">\${{r.note ?? ''}}</td>
-      <td class="col-date">\${{fmtDate(r.created_at)}}</td>`;
+      <td class="col-id">${{r.id}}</td>
+      <td class="col-type">${{r.type}}</td>
+      <td class="col-amt" style="text-align:right">${{money(r.amount)}}</td>
+      <td class="col-cur">${{r.currency}}</td>
+      <td class="col-cat">${{r.category ?? ''}}</td>
+      <td class="col-note">${{r.note ?? ''}}</td>
+      <td class="col-date">${{fmtDate(r.created_at)}}</td>`;
     tb.appendChild(tr);
   }}
 }}
 document.getElementById('apply').addEventListener('click', loadData);
 document.getElementById('pdf').addEventListener('click', () => {{
   const u = currentQuery(); u.pathname = '/dashboard/pdf';
+  // forza download
   window.location.href = u.toString();
 }});
-loadData(); // nessun range di default: mostra TUTTO
+loadData(); // non setto default: se lasci vuote le date, vedi tutto (il browser può precompilare)
 </script>
 </body></html>"""
     return HTMLResponse(html)
@@ -1129,7 +1118,6 @@ async def dashboard_data(
     d_to   = _iso_or_none(to)
     if type not in (None, "", "in", "out"):
         raise HTTPException(status_code=400, detail="invalid type")
-
     with get_conn() as conn:
         rows = _fetch_dashboard_rows(conn, d_from, d_to, type, q, limit=100000)
 
@@ -1140,8 +1128,7 @@ async def dashboard_data(
         else: s_out += amt
         out_rows.append({
             "id": r["id"], "type": r["type"], "amount": str(amt),
-            "currency": r["currency"], "category": r["category"],
-            "note": r["note"],
+            "currency": r["currency"], "category": r["category"], "note": r["note"],
             "created_at": r["created_at"].isoformat() if hasattr(r["created_at"],"isoformat") else r["created_at"],
         })
     return JSONResponse({"rows": out_rows, "sum_in": str(s_in), "sum_out": str(s_out), "sum_net": str(s_in - s_out)})
@@ -1171,8 +1158,8 @@ async def dashboard_pdf(
         y = height - 20*mm
         title = "FLAI – Report"
         if d_from or d_to: title += f" ({d_from or ''} → {d_to or ''})"
-        if type: title += f" • {type}"
-        if q:    title += f" • filtro: {q}"
+        if type: title += f" · {type}"
+        if q:    title += f" · filtro: {q}"
         c.setFont("Helvetica-Bold", 14); c.drawString(20*mm, y, title); y -= 10*mm
         c.setFont("Helvetica-Bold", 10)
         c.drawString(20*mm,y,"ID"); c.drawString(35*mm,y,"TP")
@@ -1197,12 +1184,12 @@ async def dashboard_pdf(
         c.drawString(20*mm,y,f"Entrate: {s_in:.2f}  •  Uscite: {s_out:.2f}  •  Netto: {net:.2f}")
         c.save()
         pdf_bytes = buff.getvalue()
-        filename = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
+        fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
         return StreamingResponse(io.BytesIO(pdf_bytes), media_type="application/pdf",
-                                 headers={{"Content-Disposition": f'attachment; filename="{filename}"'}})
+                                 headers={{"Content-Disposition": f'attachment; filename="{fname}"'}})
     except Exception:
         txt = "\n".join([f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}" for r in rows])
-        filename = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
+        fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
         return StreamingResponse(io.BytesIO(txt.encode("utf-8")), media_type="text/plain",
-                                 headers={{"Content-Disposition": f'attachment; filename="{filename}"'}})
+                                 headers={{"Content-Disposition": f'attachment; filename="{fname}"'}})
 # === FINE DASHBOARD ============================================================
