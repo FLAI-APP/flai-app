@@ -902,16 +902,15 @@ async def email_report(
 # === DASHBOARD (HTML + API dati + PDF) ========================================
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi import Request, HTTPException, Query
-import os, io, json
+import os, io
 import datetime as dt
 from decimal import Decimal
 
-# Brand (ENV consigliate: BRAND_BLUE, ACCENT_GOLD, LOGO_URL)
 BRAND_BLUE = os.getenv("BRAND_BLUE", "#000A22")
 ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#AA8F15")
-LOGO_URL    = os.getenv("LOGO_URL", "").strip()  # es: raw GitHub o /static/logo.png
+LOGO_URL    = os.getenv("LOGO_URL", "").strip()
 
-# --- DB connector: usa get_conn() se già definita altrove, altrimenti fallback ---
+# usa get_conn() esistente se già definito nel file
 try:
     get_conn  # type: ignore
 except NameError:
@@ -922,40 +921,29 @@ except NameError:
             raise RuntimeError("DATABASE_URL not set")
         return psycopg.connect(url, row_factory=psycopg.rows.dict_row)
 
-# --- Helpers -------------------------------------------------------------------
 def _iso_or_none(s: str | None) -> dt.date | None:
-    if not s:
-        return None
-    try:
-        return dt.date.fromisoformat(s)
-    except Exception:
-        return None
+    if not s: return None
+    try: return dt.date.fromisoformat(s)
+    except Exception: return None
 
 def _like(s: str | None) -> str | None:
     return f"%{s.strip()}%" if s and s.strip() else None
 
-def _fetch_dashboard_rows(
-    conn,
-    d_from: dt.date | None,
-    d_to: dt.date | None,
-    typ: str | None,
-    q: str | None,
-    limit: int = 2000,  # ampio per “mostra tutto”
-):
+def _fetch_dashboard_rows(conn, d_from, d_to, typ, q, limit=100000):
     sql = """
         SELECT id, type, amount::numeric(14,2) AS amount, currency, category,
                COALESCE(note,'') AS note, created_at
         FROM movements
         WHERE 1=1
     """
-    params: list = []
+    params = []
     if d_from:
         sql += " AND created_at::date >= %s"
         params.append(d_from)
     if d_to:
         sql += " AND created_at::date <= %s"
         params.append(d_to)
-    if typ in ("in", "out"):
+    if typ in ("in","out"):
         sql += " AND type = %s"
         params.append(typ)
     if q:
@@ -969,7 +957,7 @@ def _fetch_dashboard_rows(
             TO_CHAR(created_at,'YYYY-MM-DD HH24:MI') ILIKE %s
         )"""
         like = _like(q)
-        params += [like, like, like, like, like, like, like]
+        params += [like]*7
 
     sql += " ORDER BY created_at DESC, id DESC"
     sql += " LIMIT %s"
@@ -979,109 +967,60 @@ def _fetch_dashboard_rows(
         c.execute(sql, params)
         return c.fetchall()
 
-# --- HTML (UI) -----------------------------------------------------------------
 @APP.get("/dashboard", response_class=HTMLResponse)  # type: ignore
 async def dashboard(request: Request) -> HTMLResponse:
-    brand = BRAND_BLUE
-    gold  = ACCENT_GOLD
-    logo  = LOGO_URL
-
-    html = f"""<!DOCTYPE html>
-<html lang="it">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+    html = f"""<!doctype html>
+<html lang="it"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>FLAI · Dashboard</title>
 <style>
 :root {{
-  --bg: #0b0f14;
-  --panel: #1b2129;
-  --panel-2: #232b35;
-  --text: #e6e7ea;
-  --muted: #9aa4b2;
-  --brand: {brand};
-  --accent: {gold};
+  --bg:#0b0f14; --panel:#1b2129; --panel2:#232b35; --text:#e6e7ea; --muted:#9aa4b2;
+  --brand:{BRAND_BLUE}; --accent:{ACCENT_GOLD};
 }}
-* {{ box-sizing: border-box; }}
-body {{
-  margin:0; background: var(--bg); color: var(--text);
-  font: 15px/1.35 -apple-system, Segoe UI, Roboto, system-ui, sans-serif;
-}}
-/* Barra brand */
-.header {{
-  background: var(--brand);
-  padding: 10px 16px;
-  display: flex; align-items: center; gap: 12px;
-}}
-.logo {{
-  width:28px;height:28px;border-radius:6px;
-  background: #12203a;
-  display:grid;place-items:center; overflow:hidden;
-  filter: brightness(0.70); /* più scuro */
-}}
-.logo img {{ width:100%; height:100%; object-fit: cover; }}
-.title {{ font-weight:700; letter-spacing:.3px; }}
-.right {{ margin-left:auto; display:flex; gap:10px; }}
-.btn {{
-  background: var(--accent); color:#111; border:0; border-radius:12px;
-  padding: 10px 12px; font-weight: 700; cursor:pointer;
-}}
-.btn:active {{ transform: translateY(1px); }}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.35 -apple-system,Segoe UI,Roboto,system-ui,sans-serif}}
+.header{{background:var(--brand);padding:10px 16px;display:flex;align-items:center;gap:12px}}
+.logo{{width:28px;height:28px;border-radius:6px;background:#12203a;overflow:hidden;filter:brightness(0.70)}}
+.logo img{{width:100%;height:100%;object-fit:cover}}
+.title{{font-weight:700;letter-spacing:.3px}}
+.wrap{{max-width:1280px;margin:18px auto;padding:0 16px}}
 
-.wrap {{ max-width: 1280px; margin: 18px auto; padding: 0 16px; }}
-.filters {{
-  display:flex; align-items:center; gap:10px; flex-wrap: wrap;
-  margin: 14px 0;
-}}
-label {{ color: var(--muted); font-size: 12px; margin-right: 6px; }}
-input[type="date"], select, input[type="text"] {{
-  background: var(--panel); color: var(--text);
-  border:1px solid #324158; border-radius: 12px; padding: 10px 12px;
-}}
-/* barra di ricerca più corta per farci stare i bottoni in linea */
-input[type="text"] {{ width: 240px; }}
-select.pill {{ appearance:none; padding-right:28px; border-radius:12px; }}
+.filters{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:14px 0}}
+label{{color:var(--muted);font-size:12px;margin-right:6px}}
+input[type=date],select,input[type=text]{{background:var(--panel);color:var(--text);border:1px solid #324158;border-radius:12px;padding:10px 12px}}
+input[type=text]{{width:240px}} /* accorciata per far stare i bottoni in riga */
+select.pill{{appearance:none;padding-right:28px;border-radius:12px}}
+.btn{{background:var(--accent);color:#111;border:0;border-radius:12px;padding:10px 12px;font-weight:700;cursor:pointer}}
+.btn:active{{transform:translateY(1px)}}
 
-.stats {{ display:flex; gap:14px; margin: 12px 0 16px; }}
-.card {{
-  flex:1; background: var(--panel-2); border:1px solid #2f3b4c;
-  border-radius: 12px; padding: 18px;
-}}
-.card h4 {{ margin:0 0 6px 0; color:#b9c2cf; font-weight:600; font-size:12px; letter-spacing:.5px; }}
-.card .v {{ font-size: 20px; font-weight:800; }}
+.stats{{display:flex;gap:14px;margin:12px 0 16px}}
+.card{{flex:1;background:var(--panel2);border:1px solid #2f3b4c;border-radius:12px;padding:18px}}
+.card h4{{margin:0 0 6px;color:#b9c2cf;font-weight:600;font-size:12px;letter-spacing:.5px}}
+.card .v{{font-size:20px;font-weight:800}}
 
-.table {{
-  background: var(--panel-2); border:1px solid #2f3b4c; border-radius: 12px;
-  overflow:auto;
-}}
-table {{ width:100%; border-collapse: collapse; }}
-th, td {{ padding: 12px 14px; text-align:left; border-bottom:1px solid #2b3545; white-space: nowrap; }}
-thead th {{ color:#b9c2cf; font-size:12px; letter-spacing:.4px; }}
-tbody tr:hover {{ background:#1f2732; }}
-
-/* larghezze colonne “come prima” */
-th.col-id,      td.col-id {{ width: 60px;  }}
-th.col-type,    td.col-type {{ width: 80px;  }}
-th.col-amt,     td.col-amt {{ width: 120px; text-align:right; }}
-th.col-cur,     td.col-cur {{ width: 80px;  }}
-th.col-cat,     td.col-cat {{ width: 180px; }}
-th.col-note,    td.col-note {{ width: 260px; overflow:hidden; text-overflow:ellipsis; }}
-th.col-date,    td.col-date {{ width: 160px; }}
-
-small.muted {{ color: var(--muted); }}
-</style>
-</head>
+.table{{background:var(--panel2);border:1px solid #2f3b4c;border-radius:12px;overflow:auto}}
+table{{width:100%;border-collapse:collapse}}
+th,td{{padding:12px 14px;text-align:left;border-bottom:1px solid #2b3545;white-space:nowrap}}
+thead th{{color:#b9c2cf;font-size:12px;letter-spacing:.4px}}
+tbody tr:hover{{background:#1f2732}}
+/* larghezze come prima */
+th.col-id,td.col-id{{width:60px}}
+th.col-type,td.col-type{{width:80px}}
+th.col-amt,td.col-amt{{width:120px;text-align:right}}
+th.col-cur,td.col-cur{{width:80px}}
+th.col-cat,td.col-cat{{width:180px}}
+th.col-note,td.col-note{{width:260px;overflow:hidden;text-overflow:ellipsis}}
+th.col-date,td.col-date{{width:160px}}
+small.muted{{color:var(--muted)}}
+</style></head>
 <body>
   <div class="header">
-    <div class="logo">{('<img src="'+logo+'" alt="logo"/>') if logo else ''}</div>
+    <div class="logo">{('<img src="{LOGO_URL}" alt="logo"/>') if LOGO_URL else ''}</div>
     <div class="title">FLAI Dashboard</div>
-    <div class="right">
-      <button id="pdf" class="btn" title="Scarica PDF">Scarica PDF</button>
-    </div>
   </div>
 
   <div class="wrap">
-    <!-- Filtro riga: Dal | Al | Tipo | Ricerca | Applica (PDF è in alto a destra) -->
     <div class="filters">
       <label>Dal</label><input id="from" type="date">
       <label>Al</label><input id="to" type="date">
@@ -1093,40 +1032,29 @@ small.muted {{ color: var(--muted); }}
       </select>
       <input id="q" type="text" placeholder="Ricerca unica (id, tipo, amount, note, categoria)">
       <button id="apply" class="btn">Applica filtri</button>
+      <button id="pdf" class="btn">Scarica PDF</button>
     </div>
 
     <div class="stats">
-      <div class="card">
-        <h4>ENTRATE</h4>
-        <div class="v" id="sum_in">0.00 CHF</div>
-      </div>
-      <div class="card">
-        <h4>USCITE</h4>
-        <div class="v" id="sum_out">0.00 CHF</div>
-      </div>
-      <div class="card">
-        <h4>NETTO</h4>
-        <div class="v" id="sum_net">0.00 CHF</div>
-      </div>
+      <div class="card"><h4>ENTRATE</h4><div class="v" id="sum_in">0.00 CHF</div></div>
+      <div class="card"><h4>USCITE</h4><div class="v" id="sum_out">0.00 CHF</div></div>
+      <div class="card"><h4>NETTO</h4><div class="v" id="sum_net">0.00 CHF</div></div>
     </div>
 
     <div class="table">
       <table id="tbl">
-        <thead>
-          <tr>
-            <th class="col-id">ID</th>
-            <th class="col-type">TIPO</th>
-            <th class="col-amt">AMOUNT</th>
-            <th class="col-cur">CURRENCY</th>
-            <th class="col-cat">CATEGORY</th>
-            <th class="col-note">NOTE</th>
-            <th class="col-date">CREATED AT</th>
-          </tr>
-        </thead>
+        <thead><tr>
+          <th class="col-id">ID</th>
+          <th class="col-type">TIPO</th>
+          <th class="col-amt">AMOUNT</th>
+          <th class="col-cur">CURRENCY</th>
+          <th class="col-cat">CATEGORY</th>
+          <th class="col-note">NOTE</th>
+          <th class="col-date">CREATED AT</th>
+        </tr></thead>
         <tbody></tbody>
       </table>
     </div>
-
     <p><small class="muted">Suggerimento: lascia vuoti “Dal/Al” per vedere **tutto**.</small></p>
   </div>
 
@@ -1159,50 +1087,36 @@ function currentQuery() {{
 async function loadData() {{
   const url = currentQuery();
   const res = await fetch(url);
-  if (!res.ok) {{
-    alert('Errore nel caricamento dati ('+res.status+')');
-    return;
-  }}
+  if (!res.ok) {{ alert('Errore nel caricamento dati ('+res.status+')'); return; }}
   const js = await res.json();
-  // KPI
   document.getElementById('sum_in').textContent  = money(js.sum_in)  + " CHF";
   document.getElementById('sum_out').textContent = money(js.sum_out) + " CHF";
   document.getElementById('sum_net').textContent = money(js.sum_net) + " CHF";
-  // table
   const tb = document.querySelector('#tbl tbody');
   tb.innerHTML = '';
   for (const r of js.rows) {{
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td class="col-id">\${r.id}</td>
-      <td class="col-type">\${r.type}</td>
-      <td class="col-amt" style="text-align:right">\${money(r.amount)}</td>
-      <td class="col-cur">\${r.currency}</td>
-      <td class="col-cat">\${r.category ?? ''}</td>
-      <td class="col-note">\${r.note ?? ''}</td>
-      <td class="col-date">\${fmtDate(r.created_at)}</td>`;
+      <td class="col-id">\${{r.id}}</td>
+      <td class="col-type">\${{r.type}}</td>
+      <td class="col-amt" style="text-align:right">\${{money(r.amount)}}</td>
+      <td class="col-cur">\${{r.currency}}</td>
+      <td class="col-cat">\${{r.category ?? ''}}</td>
+      <td class="col-note">\${{r.note ?? ''}}</td>
+      <td class="col-date">\${{fmtDate(r.created_at)}}</td>`;
     tb.appendChild(tr);
   }}
 }}
-// Applica filtri
 document.getElementById('apply').addEventListener('click', loadData);
-
-// Scarica PDF (download diretto, attachment)
 document.getElementById('pdf').addEventListener('click', () => {{
-  const u = currentQuery();
-  u.pathname = '/dashboard/pdf';
+  const u = currentQuery(); u.pathname = '/dashboard/pdf';
   window.location.href = u.toString();
 }});
-
-// ⚠️ NIENTE range di default: lasciamo i campi vuoti così vedi TUTTO
-loadData();
+loadData(); // nessun range di default: mostra TUTTO
 </script>
-</body>
-</html>
-"""
+</body></html>"""
     return HTMLResponse(html)
 
-# --- API dati ------------------------------------------------------------------
 @APP.get("/dashboard/data", response_class=JSONResponse)  # type: ignore
 async def dashboard_data(
     request: Request,
@@ -1217,35 +1131,21 @@ async def dashboard_data(
         raise HTTPException(status_code=400, detail="invalid type")
 
     with get_conn() as conn:
-        rows = _fetch_dashboard_rows(conn, d_from, d_to, type, q, limit=2000)
+        rows = _fetch_dashboard_rows(conn, d_from, d_to, type, q, limit=100000)
 
-    s_in  = Decimal("0")
-    s_out = Decimal("0")
-    out_rows = []
+    s_in = Decimal("0"); s_out = Decimal("0"); out_rows = []
     for r in rows:
         amt = Decimal(str(r["amount"]))
-        if r["type"] == "in":
-            s_in += amt
-        else:
-            s_out += amt
+        if r["type"] == "in": s_in += amt
+        else: s_out += amt
         out_rows.append({
-            "id": r["id"],
-            "type": r["type"],
-            "amount": str(amt),
-            "currency": r["currency"],
-            "category": r["category"],
+            "id": r["id"], "type": r["type"], "amount": str(amt),
+            "currency": r["currency"], "category": r["category"],
             "note": r["note"],
-            "created_at": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else r["created_at"],
+            "created_at": r["created_at"].isoformat() if hasattr(r["created_at"],"isoformat") else r["created_at"],
         })
+    return JSONResponse({"rows": out_rows, "sum_in": str(s_in), "sum_out": str(s_out), "sum_net": str(s_in - s_out)})
 
-    return JSONResponse({
-        "rows": out_rows,
-        "sum_in": str(s_in),
-        "sum_out": str(s_out),
-        "sum_net": str(s_in - s_out),
-    })
-
-# --- PDF (download come allegato) ---------------------------------------------
 @APP.get("/dashboard/pdf")  # type: ignore
 async def dashboard_pdf(
     request: Request,
@@ -1258,78 +1158,51 @@ async def dashboard_pdf(
     d_to   = _iso_or_none(to)
     if type not in (None, "", "in", "out"):
         raise HTTPException(status_code=400, detail="invalid type")
-
     with get_conn() as conn:
-        rows = _fetch_dashboard_rows(conn, d_from, d_to, type, q, limit=5000)
+        rows = _fetch_dashboard_rows(conn, d_from, d_to, type, q, limit=100000)
 
-    # PDF via reportlab; fallback TXT se non installato
     buff = io.BytesIO()
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.pdfgen import canvas
         from reportlab.lib.units import mm
-
         width, height = A4
         c = canvas.Canvas(buff, pagesize=A4)
         y = height - 20*mm
-
         title = "FLAI – Report"
-        if d_from or d_to:
-            title += f" ({d_from or ''} → {d_to or ''})"
-        if type:
-            title += f"  •  {type}"
-        if q:
-            title += f"  •  filtro: {q}"
-
+        if d_from or d_to: title += f" ({d_from or ''} → {d_to or ''})"
+        if type: title += f" • {type}"
+        if q:    title += f" • filtro: {q}"
         c.setFont("Helvetica-Bold", 14); c.drawString(20*mm, y, title); y -= 10*mm
         c.setFont("Helvetica-Bold", 10)
-        c.drawString(20*mm, y, "ID");      c.drawString(35*mm, y, "TP")
-        c.drawString(45*mm, y, "AMOUNT");  c.drawString(75*mm, y, "CUR")
-        c.drawString(90*mm, y, "CATEGORY");c.drawString(140*mm, y, "NOTE"); y -= 6*mm
+        c.drawString(20*mm,y,"ID"); c.drawString(35*mm,y,"TP")
+        c.drawString(45*mm,y,"AMOUNT"); c.drawString(75*mm,y,"CUR")
+        c.drawString(90*mm,y,"CATEGORY"); c.drawString(140*mm,y,"NOTE"); y -= 6*mm
         c.setFont("Helvetica", 10)
         s_in = Decimal("0"); s_out = Decimal("0")
-
         for r in rows:
             amt = Decimal(str(r["amount"]))
             if r["type"] == "in": s_in += amt
             else: s_out += amt
-            if y < 20*mm:
-                c.showPage(); y = height - 20*mm; c.setFont("Helvetica", 10)
-            c.drawString(20*mm, y, str(r["id"]))
-            c.drawString(35*mm, y, r["type"])
-            c.drawRightString(72*mm, y, f"{amt:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-            c.drawString(75*mm, y, r["currency"])
-            c.drawString(90*mm, y, (r["category"] or "")[:24])
-            c.drawString(140*mm, y, (r["note"] or "")[:38])
+            if y < 20*mm: c.showPage(); y = height - 20*mm; c.setFont("Helvetica",10)
+            c.drawString(20*mm,y,str(r["id"]))
+            c.drawString(35*mm,y,r["type"])
+            c.drawRightString(72*mm,y,f"{amt:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+            c.drawString(75*mm,y,r["currency"])
+            c.drawString(90*mm,y,(r["category"] or "")[:24])
+            c.drawString(140*mm,y,(r["note"] or "")[:38])
             y -= 5.5*mm
-
-        y -= 6*mm
-        c.setFont("Helvetica-Bold", 11)
+        y -= 6*mm; c.setFont("Helvetica-Bold",11)
         net = s_in - s_out
-        c.drawString(20*mm, y, f"Entrate: {s_in:.2f}  •  Uscite: {s_out:.2f}  •  Netto: {net:.2f}")
+        c.drawString(20*mm,y,f"Entrate: {s_in:.2f}  •  Uscite: {s_out:.2f}  •  Netto: {net:.2f}")
         c.save()
-
         pdf_bytes = buff.getvalue()
         filename = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
-            media_type="application/pdf",
-            headers={{"Content-Disposition": f'attachment; filename="{filename}"'}}
-        )
+        return StreamingResponse(io.BytesIO(pdf_bytes), media_type="application/pdf",
+                                 headers={{"Content-Disposition": f'attachment; filename="{filename}"'}})
     except Exception:
-        # Fallback TXT
-        lines = []
-        lines.append("FLAI – Report")
-        lines.append(f"Range: {(d_from or '')} → {(d_to or '')}")
-        if type: lines.append(f"Tipo: {type}")
-        if q:    lines.append(f"Filtro: {q}")
-        lines.append("")
-        for r in rows:
-            lines.append(f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}")
-        buff = io.BytesIO("\n".join(lines).encode("utf-8"))
+        txt = "\n".join([f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}" for r in rows])
         filename = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
-        return StreamingResponse(
-            buff, media_type="text/plain",
-            headers={{"Content-Disposition": f'attachment; filename="{filename}"'}}
-        )
+        return StreamingResponse(io.BytesIO(txt.encode("utf-8")), media_type="text/plain",
+                                 headers={{"Content-Disposition": f'attachment; filename="{filename}"'}})
 # === FINE DASHBOARD ============================================================
