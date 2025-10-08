@@ -899,322 +899,332 @@ async def email_report(
 # === FINE EMAIL ===============================================================
 
 
-# ==============================================================
-# DASHBOARD (HTML + API dati) – header brand, search unica, PDF
-# ==============================================================
+# ====================== DASHBOARD (HTML + DATA + PDF) ======================
+# Import locali alla sezione (ok se duplicano import già presenti)
+import os, io
+from datetime import datetime, timedelta, date
+from typing import Optional
 
+from fastapi import Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-import os, io, base64, json
-from typing import Optional, List, Dict, Any
-from datetime import date as _date, datetime, timezone
-from decimal import Decimal
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from starlette.status import HTTP_401_UNAUTHORIZED
 
-# --- Brand / logo / colori (da ENV) ---
-BRAND_BLUE = os.getenv("BRAND_BLUE", "#0b2a44")
-ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#aa8f15")
-LOGO_URL   = os.getenv("LOGO_URL", "").strip()
+import psycopg
+from psycopg.rows import dict_row
 
-# --- Basic auth (usa ENV esistenti DASHBOARD_USER / DASHBOARD_PASSWORD) ---
-DASH_USER = os.getenv("DASHBOARD_USER", os.getenv("DASH_USER", ""))
-DASH_PASS = os.getenv("DASHBOARD_PASSWORD", os.getenv("DASH_PASS", ""))
+# ---- Config letta da env (riusa le tue variabili) ----
+DASH_USER = os.getenv("DASHBOARD_USER") or os.getenv("DASH_USER") or "flai"
+DASH_PASS = os.getenv("DASHBOARD_PASSWORD") or os.getenv("DASH_PASSWORD") or "flai-test"
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+BRAND_BLUE = os.getenv("BRAND_BLUE", "#0B2A44")
+ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#D4AF37")
+LOGO_URL = os.getenv("LOGO_URL", "")  # URL pubblico al logo (PNG/JPG)
 
-PROTECTED_PREFIXES = ("/dashboard", "/analytics", "/pdf")
+dash_sec = HTTPBasic()
 
-def _needs_auth(path: str) -> bool:
-    return any(path == p or path.startswith(p + "/") for p in PROTECTED_PREFIXES)
+def dash_auth(creds: HTTPBasicCredentials = Depends(dash_sec)):
+    if creds.username != DASH_USER or creds.password != DASH_PASS:
+        raise HTTPException(
+            status_code=HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return True
 
-@APP.middleware("http")
-async def _auth_and_rate(request: Request, call_next):
-    # esenta healthz, webhook, whatsapp verify
-    open_paths = {"/", "/healthz", "/webhook", "/whatsapp/verify"}
-    if request.url.path in open_paths:
-        return await call_next(request)
+def dash_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL mancante")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
-    # basic auth
-    if _needs_auth(request.url.path) and (DASH_USER and DASH_PASS):
-        hdr = request.headers.get("authorization", "")
-        ok = False
-        if hdr.startswith("Basic "):
-            try:
-                user, pwd = base64.b64decode(hdr.split(" ", 1)[1]).decode("utf-8").split(":", 1)
-                ok = (user == DASH_USER and pwd == DASH_PASS)
-            except Exception:
-                ok = False
-        if not ok:
-            return HTMLResponse(
-                status_code=401,
-                headers={"WWW-Authenticate": "Basic realm=flai"},
-                content="<h3>Auth required</h3>"
-            )
-    return await call_next(request)
+def dash_parse_date(s: Optional[str]) -> Optional[date]:
+    if not s: return None
+    try: return datetime.strptime(s, "%Y-%m-%d").date()
+    except: return None
 
-# --- Utils ---
-def _iso_or_none(s: Optional[str]) -> Optional[_date]:
-    if not s:
-        return None
-    try:
-        return _date.fromisoformat(s)
-    except Exception:
-        return None
+def dash_default_range():
+    today = date.today()
+    return (today - timedelta(days=29)), today
 
-def _fmt_money(chf: Decimal | float | int) -> str:
-    try:
-        v = Decimal(chf)
-    except Exception:
-        v = Decimal(0)
-    return f"{v:.2f} CHF"
-
-def _fmt_dt(d: datetime) -> str:
-    # YYYY-MM-DD HH:MM (senza secondi)
-    try:
-        return d.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return str(d)
-
-def _like_or_none(s: Optional[str]) -> Optional[str]:
-    s = (s or "").strip()
-    return f"%{s}%" if s else None
-
-# --- DATA API --------------------------------------------------
-@APP.get("/dashboard/data")
-async def dashboard_data(
-    _from: Optional[str] = None,
-    to: Optional[str] = None,
-    typ: Optional[str] = None,   # "in" | "out" | None
-    q: Optional[str] = None
-):
-    d_from = _iso_or_none(_from)
-    d_to   = _iso_or_none(to)
-    like   = _like_or_none(q)
-    with get_conn() as conn, conn.cursor() as c:
-        # elenco righe
-        sql = """
-        SELECT id,
-               type,
-               amount::numeric(14,2),
-               currency,
-               category,
-               COALESCE(note,'') AS note,
-               created_at
-        FROM movements
-        WHERE 1=1
+def dash_fetch(d_from: Optional[date], d_to: Optional[date], mov_type: Optional[str], q: Optional[str]):
+    sql = """
+      SELECT id, "type", amount, currency, category, note, created_at
+      FROM movements
+      WHERE 1=1
+    """
+    p = {}
+    if d_from:
+        sql += " AND created_at >= %(df)s"
+        p["df"] = datetime(d_from.year, d_from.month, d_from.day)
+    if d_to:
+        sql += " AND created_at < %(dt)s"
+        p["dt"] = datetime(d_to.year, d_to.month, d_to.day) + timedelta(days=1)
+    if mov_type in ("in","out"):
+        sql += ' AND "type" = %(t)s'
+        p["t"] = mov_type
+    if q:
+        sql += """
+          AND (
+            CAST(id AS TEXT) ILIKE %(pat)s OR
+            "type" ILIKE %(pat)s OR
+            CAST(amount AS TEXT) ILIKE %(pat)s OR
+            currency ILIKE %(pat)s OR
+            category ILIKE %(pat)s OR
+            note ILIKE %(pat)s OR
+            TO_CHAR(created_at,'YYYY-MM-DD HH24:MI') ILIKE %(pat)s
+          )
         """
-        params: List[Any] = []
-        if d_from:
-            sql += " AND created_at::date >= %s"
-            params.append(d_from)
-        if d_to:
-            sql += " AND created_at::date <= %s"
-            params.append(d_to)
-        if typ in ("in","out"):
-            sql += " AND type = %s"
-            params.append(typ)
-        if like:
-            sql += """ AND (
-                CAST(id AS TEXT) ILIKE %s OR
-                type ILIKE %s OR
-                CAST(amount AS TEXT) ILIKE %s OR
-                currency ILIKE %s OR
-                COALESCE(category,'') ILIKE %s OR
-                COALESCE(note,'') ILIKE %s
-            )"""
-            params += [like,like,like,like,like,like]
-        sql += " ORDER BY created_at DESC, id DESC LIMIT 500"
-        c.execute(sql, params)
-        rows_db = c.fetchall()
+        p["pat"] = f"%{q}%"
+    sql += " ORDER BY created_at DESC LIMIT 2000"
 
-        rows = []
-        tot_in = Decimal(0)
-        tot_out = Decimal(0)
-        for rid, rtype, amount, curr, cat, note, created in rows_db:
-            if rtype == "in":
-                tot_in += Decimal(amount or 0)
-            elif rtype == "out":
-                tot_out += Decimal(amount or 0)
-            rows.append({
-                "id": rid,
-                "type": rtype,
-                "amount": f"{Decimal(amount):.2f}",
-                "currency": curr,
-                "category": cat,
-                "note": note,
-                "created_at": _fmt_dt(created),
-            })
-        net = tot_in - tot_out
+    tot = """
+      SELECT
+        COALESCE(SUM(CASE WHEN "type"='in'  THEN amount END),0) AS total_in,
+        COALESCE(SUM(CASE WHEN "type"='out' THEN amount END),0) AS total_out
+      FROM movements
+      WHERE 1=1
+    """
+    if d_from:  tot += " AND created_at >= %(df)s"
+    if d_to:    tot += " AND created_at < %(dt)s"
+    if mov_type in ("in","out"): tot += ' AND "type" = %(t)s'
+    if q:
+        tot += """
+          AND (
+            CAST(id AS TEXT) ILIKE %(pat)s OR
+            "type" ILIKE %(pat)s OR
+            CAST(amount AS TEXT) ILIKE %(pat)s OR
+            currency ILIKE %(pat)s OR
+            category ILIKE %(pat)s OR
+            note ILIKE %(pat)s OR
+            TO_CHAR(created_at,'YYYY-MM-DD HH24:MI') ILIKE %(pat)s
+          )
+        """
 
-    return JSONResponse({
-        "ok": True,
-        "in":  _fmt_money(tot_in),
-        "out": _fmt_money(tot_out),
-        "net": _fmt_money(net),
-        "rows": rows
-    })
+    with dash_conn() as c:
+        rows = c.execute(sql, p).fetchall()
+        totals = c.execute(tot, p).fetchone()
 
-# --- PDF export (minimale, stesso filtro della tabella) --------
-@APP.get("/dashboard/pdf")
-async def dashboard_pdf(
-    _from: Optional[str] = None,
-    to: Optional[str] = None,
-    typ: Optional[str] = None,
-    q: Optional[str] = None
-):
-    # riusa l’API dati per non duplicare logica
-    data = await dashboard_data(_from=_from, to=to, typ=typ, q=q)
-    payload = json.loads(data.body.decode("utf-8"))
+    items = []
+    for r in rows:
+        ts = r["created_at"]
+        ts_fmt = ts.strftime("%Y-%m-%d %H:%M") if isinstance(ts, datetime) else str(ts)
+        items.append({
+            "id": r["id"],
+            "type": r["type"],
+            "amount": float(r["amount"]) if r["amount"] is not None else 0.0,
+            "currency": r.get("currency") or "",
+            "category": (r.get("category") or ""),
+            "note": (r.get("note") or ""),
+            "created_at": ts_fmt,
+        })
+    t_in  = float(totals["total_in"] if totals and totals["total_in"] is not None else 0.0)
+    t_out = float(totals["total_out"] if totals and totals["total_out"] is not None else 0.0)
+    return items, {"in": t_in, "out": t_out, "net": t_in - t_out}
 
-    lines = []
-    lines.append(f"FLAI – Report  ({_from or 'None'} → {to or 'None'})")
-    lines.append(f"Entrate: {payload['in']}   Uscite: {payload['out']}   Netto: {payload['net']}")
-    lines.append("")
-    lines.append("id  | tipo | amount | currency | category | note | created_at")
-    lines.append("-"*92)
-    for r in payload["rows"]:
-        lines.append(f"{r['id']:>4} | {r['type']:<3} | {r['amount']:>8} | {r['currency']:<7} | "
-                     f"{(r['category'] or ''):<12} | { (r['note'] or '')[:30]:<30} | {r['created_at']}")
-
-    # tenta PDF se reportlab è installato, altrimenti TXT
-    buff = io.BytesIO()
-    try:
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.units import mm
-        pdf = canvas.Canvas(buff, pagesize=A4)
-        width, height = A4
-        y = height - 20*mm
-        for ln in lines:
-            pdf.drawString(15*mm, y, ln[:120])
-            y -= 6*mm
-            if y < 20*mm:
-                pdf.showPage()
-                y = height - 20*mm
-        pdf.save()
-        buff.seek(0)
-        return StreamingResponse(
-            buff, media_type="application/pdf",
-            headers={"Content-Disposition": "inline; filename=flai_report.pdf"}
-        )
-    except Exception:
-        txt = ("\n".join(lines)).encode("utf-8")
-        bio = io.BytesIO(txt); bio.seek(0)
-        return StreamingResponse(
-            bio, media_type="text/plain",
-            headers={"Content-Disposition": "inline; filename=flai_report.txt"}
-        )
-
-# --- Pagina HTML (niente f-string interne per evitare conflitti con ${} JS) ---
 @APP.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(request: Request):
-    logo_html = f'<img src="{LOGO_URL}" alt="logo" class="logo"/>' if LOGO_URL else ""
-    tpl = r"""<!doctype html>
-<html lang="it"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>FLAI · Dashboard</title>
-<style>
-:root{
-  --brand: %%BRAND%%; --gold: %%GOLD%%;
-  --bg:#0c0f14; --panel:#1c222b; --panel-2:#232b35;
-  --text:#e8edf4; --muted:#9aa7b4; --radius:10px;
-}
-*{box-sizing:border-box} html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-header.top{background:var(--brand);padding:10px 16px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:10;border-bottom:1px solid rgba(255,255,255,.06)}
-.logo{width:28px;height:28px;border-radius:6px;object-fit:cover;filter:brightness(.75) saturate(1.05)} /* più scuro */
-.brand{font-weight:800;letter-spacing:.5px}
-.bar{display:flex;gap:8px;align-items:center;flex:1;justify-content:center}
-.btn{background:var(--gold);color:#121212;border:none;padding:8px 12px;border-radius:8px;font-weight:700;cursor:pointer}
-.btn:disabled{opacity:.6;cursor:not-allowed}
-.pill{background:var(--panel);border:1px solid #2f3947;color:var(--text);padding:8px 10px;border-radius:8px}
-main{max-width:1180px;margin:18px auto;padding:0 10px;display:grid;gap:14px} /* margini laterali leggermente più stretti */
-.cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
-.card{background:var(--panel);border:1px solid #2f3947;border-radius:var(--radius);padding:14px 16px}
-.title{color:var(--muted);font-weight:700;margin-bottom:6px}
-.val{font-size:18px;font-weight:900}
-.table{background:var(--panel);border:1px solid #2f3947;border-radius:var(--radius);overflow:hidden}
-table{width:100%;border-collapse:collapse}
-thead th{text-align:left;font-size:12px;letter-spacing:.6px;color:var(--muted);padding:10px 12px;background:var(--panel-2)}
-tbody td{padding:12px;border-top:1px solid #2f3947}
-colgroup col.id{width:6ch} colgroup col.type{width:8ch} colgroup col.amount{width:12ch}
-colgroup col.curr{width:8ch} colgroup col.cat{width:22ch} colgroup col.note{width:auto} colgroup col.created{width:18ch}
-.right{text-align:right} .muted{color:var(--muted)}
-.toast{position:fixed;inset:auto 12px 12px auto;background:#2f3947;color:#fff;padding:10px 12px;border-radius:8px;display:none}
-</style></head>
+def dashboard(_: bool = Depends(dash_auth)):
+    logo = (f'<img src="{LOGO_URL}" alt="logo" style="height:40px;opacity:.80"/>' if LOGO_URL
+            else '<div style="color:#fff;font-weight:800;">FLAI</div>')
+    css = f"""
+    :root {{
+      --brand: {BRAND_BLUE};
+      --accent: {ACCENT_GOLD};
+      --bg: #0f1115;
+      --card: #151922;
+      --muted: #8ea0b6;
+      --text: #e5efff;
+    }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; background:var(--bg); color:var(--text);
+           font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+    header {{ background:var(--brand); padding:12px 18px; display:flex; align-items:center; gap:12px;
+             border-bottom:1px solid rgba(255,255,255,.08); }}
+    .title {{ font-weight:800; letter-spacing:.4px; }}
+    .wrap {{ max-width:1280px; margin:18px auto; padding:0 16px; }}
+    .toolbar {{ display:grid; grid-template-columns: repeat(7, minmax(0,1fr)); gap:10px; align-items:end; margin-bottom:12px; }}
+    label {{ font-size:12px; color:var(--muted); display:block; margin-bottom:6px; }}
+    input, select {{ width:100%; padding:10px 12px; background:#0f1320; color:var(--text);
+                     border:1px solid #243149; border-radius:8px; outline:none; }}
+    button, .btn {{ background:var(--accent); color:#0b0b0b; border:none; border-radius:8px; padding:10px 14px;
+                    font-weight:800; cursor:pointer; text-decoration:none; text-align:center; }}
+    .cards {{ display:grid; grid-template-columns: repeat(3,1fr); gap:12px; margin:10px 0 16px; }}
+    .card {{ background:var(--card); border:1px solid #243149; border-radius:14px; padding:16px; }}
+    .card h3 {{ margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:700; }}
+    .card .val {{ font-size:22px; font-weight:900; }}
+    .table-wrap {{ background:var(--card); border:1px solid #243149; border-radius:14px; overflow:hidden; }}
+    table {{ width:100%; border-collapse:collapse; }}
+    thead th {{ text-align:left; font-size:12px; color:var(--muted); background:#0f1320;
+               padding:10px; border-bottom:1px solid #243149; }}
+    tbody td {{ padding:10px; border-bottom:1px solid #1d2537; font-size:14px; }}
+    tbody tr:hover {{ background:#10182a; }}
+    .num {{ text-align:right; font-variant-numeric: tabular-nums; }}
+    .w-id{{width:70px}} .w-type{{width:90px}} .w-amt{{width:140px}} .w-cur{{width:90px}}
+    .w-cat{{width:260px}} .w-note{{width:auto}} .w-ts{{width:170px}}
+    .err {{ color:#ff6b6b; font-weight:800; margin-top:8px; }}
+    """
+    html = f"""
+<!doctype html>
+<html><head>
+  <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>FLAI Dashboard</title>
+  <style>{css}</style>
+</head>
 <body>
-<header class="top">
-  %%LOGO_HTML%% <div class="brand">FLAI · Dashboard</div>
-  <div class="bar">
-    <span>Dal</span><input id="from" type="date" class="pill"/><span>al</span><input id="to" type="date" class="pill"/>
-    <select id="typ" class="pill"><option value="">TUTTI I TIPI</option><option value="in">ENTRATE</option><option value="out">USCITE</option></select>
-    <input id="q" class="pill" placeholder="cerca testo (id, tipo, amount, note, categoria)"/>
-    <button id="apply" class="btn">Applica filtri</button>
-  </div>
-  <button id="pdf" class="btn">Scarica PDF</button>
+<header>
+  {logo}
+  <div class="title">FLAI Dashboard</div>
 </header>
-
-<main>
-  <div class="cards">
-    <div class="card"><div class="title">ENTRATE</div><div class="val" id="in">0.00 CHF</div></div>
-    <div class="card"><div class="title">USCITE</div><div class="val" id="out">0.00 CHF</div></div>
-    <div class="card"><div class="title">NETTO</div><div class="val" id="net">0.00 CHF</div></div>
+<div class="wrap">
+  <div class="toolbar">
+    <div><label>Dal</label><input type="date" id="from"></div>
+    <div><label>Al</label><input type="date" id="to"></div>
+    <div><label>Tipo</label>
+      <select id="movtype"><option value="">Tutti</option><option value="in">Entrate</option><option value="out">Uscite</option></select>
+    </div>
+    <div style="grid-column: span 3;"><label>Ricerca unica</label>
+      <input id="q" placeholder="es. fornitori, CHF, 2025-09, nota...">
+    </div>
+    <div><label>&nbsp;</label><button id="apply">Applica filtri</button></div>
+    <div><label>&nbsp;</label><a id="pdfbtn" class="btn" href="#" target="_blank">Scarica PDF</a></div>
   </div>
-  <div class="table">
+
+  <div class="cards">
+    <div class="card"><h3>Entrate</h3><div id="v_in" class="val">0.00</div></div>
+    <div class="card"><h3>Uscite</h3><div id="v_out" class="val">0.00</div></div>
+    <div class="card"><h3>Netto</h3><div id="v_net" class="val">0.00</div></div>
+  </div>
+
+  <div class="table-wrap">
     <table>
-      <colgroup><col class="id"><col class="type"><col class="amount"><col class="curr"><col class="cat"><col class="note"><col class="created"></colgroup>
-      <thead><tr><th>ID</th><th>TIPO</th><th>AMOUNT</th><th>CURRENCY</th><th>CATEGORY</th><th>NOTE</th><th class="right">CREATED AT</th></tr></thead>
-      <tbody id="rows"></tbody>
+      <thead>
+        <tr>
+          <th class="w-id">ID</th><th class="w-type">TIPO</th><th class="w-amt num">AMOUNT</th>
+          <th class="w-cur">CURRENCY</th><th class="w-cat">CATEGORY</th>
+          <th class="w-note">NOTE</th><th class="w-ts">CREATED AT</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
     </table>
   </div>
-</main>
-<div id="toast" class="toast">Errore nel caricamento dati</div>
 
+  <div id="err" class="err"></div>
+</div>
 <script>
-const byId = x => document.getElementById(x);
-const elFrom = byId('from'), elTo = byId('to'), elTyp = byId('typ'), elQ = byId('q');
-const elIn = byId('in'), elOut = byId('out'), elNet = byId('net'), elRows = byId('rows');
-
-const today = new Date(); const lastMonth = new Date(today); lastMonth.setMonth(today.getMonth()-1);
-const iso = d => d.toISOString().slice(0,10); elFrom.value = iso(lastMonth); elTo.value = iso(today);
-
-function toast(msg){ const t=byId('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none',2500); }
-
-async function load(){
-  const p = new URLSearchParams();
-  if(elFrom.value) p.set('_from', elFrom.value);
-  if(elTo.value)   p.set('to', elTo.value);
-  if(elTyp.value)  p.set('typ', elTyp.value);
-  if(elQ.value)    p.set('q', elQ.value);
-  const resp = await fetch('/dashboard/data?' + p.toString(), {cache:'no-store'});
-  if(!resp.ok){ toast('Errore nel caricamento dati ('+resp.status+')'); return; }
-  const data = await resp.json();
-  elIn.textContent  = data.in;
-  elOut.textContent = data.out;
-  elNet.textContent = data.net;
-  elRows.innerHTML='';
-  for(const r of data.rows){
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${r.id}</td>
-      <td>${r.type}</td>
-      <td class="right">${r.amount}</td>
-      <td>${r.currency}</td>
-      <td>${r.category||''}</td>
-      <td>${r.note||''}</td>
-      <td class="right">${r.created_at}</td>`;
-    elRows.appendChild(tr);
-  }
-}
-byId('apply').addEventListener('click', load);
-byId('pdf').addEventListener('click', ()=>{
-  const p = new URLSearchParams();
-  if(elFrom.value) p.set('_from', elFrom.value);
-  if(elTo.value)   p.set('to', elTo.value);
-  if(elTyp.value)  p.set('typ', elTyp.value);
-  if(elQ.value)    p.set('q', elQ.value);
-  window.open('/dashboard/pdf?' + p.toString(), '_blank');
-});
-load();
+function fmt(x){{return (Math.round((x||0)*100)/100).toFixed(2);}}
+function params(){{
+  const usp=new URLSearchParams();
+  const f=document.getElementById('from').value, t=document.getElementById('to').value;
+  const mt=document.getElementById('movtype').value, q=document.getElementById('q').value.trim();
+  if(f)usp.set('from',f); if(t)usp.set('to',t); if(mt)usp.set('type',mt); if(q)usp.set('q',q);
+  return usp;
+}}
+async function loadData(){{
+  const e=document.getElementById('err'); e.textContent='';
+  const qs=params().toString();
+  try{{
+    const r=await fetch('/dashboard/data'+(qs?('?'+qs):'')); if(!r.ok) throw new Error('HTTP '+r.status);
+    const j=await r.json();
+    document.getElementById('v_in').textContent=fmt(j.totals.in);
+    document.getElementById('v_out').textContent=fmt(j.totals.out);
+    document.getElementById('v_net').textContent=fmt(j.totals.net);
+    const tb=document.getElementById('tbody'); tb.innerHTML='';
+    for(const m of j.items){{
+      const tr=document.createElement('tr');
+      tr.innerHTML = `
+        <td class="w-id">${{m.id}}</td>
+        <td class="w-type">${{m.type}}</td>
+        <td class="w-amt num">${{fmt(m.amount)}}</td>
+        <td class="w-cur">${{m.currency}}</td>
+        <td class="w-cat">${{m.category||''}}</td>
+        <td class="w-note">${{m.note||''}}</td>
+        <td class="w-ts">${{m.created_at}}</td>`;
+      tb.appendChild(tr);
+    }}
+    document.getElementById('pdfbtn').href = '/dashboard/pdf'+(qs?('?'+qs):'');
+  }}catch(err){{
+    console.error(err); e.textContent='Errore nel caricamento dati ('+err.message+')';
+  }}
+}}
+function setDefaults(){{
+  const t=new Date(), s=new Date(t.getTime()-29*24*60*60*1000);
+  const iso=d=>d.toISOString().slice(0,10);
+  document.getElementById('from').value=iso(s);
+  document.getElementById('to').value=iso(t);
+}}
+document.getElementById('apply').addEventListener('click',e=>{{e.preventDefault();loadData();}});
+setDefaults(); loadData();
 </script>
-</body></html>"""
-    html = (tpl
-            .replace("%%BRAND%%", BRAND_BLUE)
-            .replace("%%GOLD%%", ACCENT_GOLD)
-            .replace("%%LOGO_HTML%%", logo_html))
-    return HTMLResponse(content=html)
+</body></html>
+    """
+    return HTMLResponse(html)
+
+@APP.get("/dashboard/data")
+def dashboard_data(
+    _ok: bool = Depends(dash_auth),
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str]   = Query(None, alias="to"),
+    type_: Optional[str] = Query(None, alias="type"),
+    q: Optional[str]     = Query(None, alias="q"),
+):
+    try:
+        df = dash_parse_date(from_)
+        dt = dash_parse_date(to)
+        if not df and not dt:
+            df, dt = dash_default_range()
+        items, totals = dash_fetch(df, dt, type_, q)
+        return {"items": items, "totals": totals}
+    except Exception as e:
+        return JSONResponse({"error":"db_failed","detail":str(e)}, status_code=500)
+
+@APP.get("/dashboard/pdf")
+def dashboard_pdf(
+    _ok: bool = Depends(dash_auth),
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str]   = Query(None, alias="to"),
+    type_: Optional[str] = Query(None, alias="type"),
+    q: Optional[str]     = Query(None, alias="q"),
+):
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import mm
+
+        df = dash_parse_date(from_)
+        dt = dash_parse_date(to)
+        if not df and not dt:
+            df, dt = dash_default_range()
+        items, totals = dash_fetch(df, dt, type_, q)
+
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=A4)
+        W,H = A4
+        c.setFont("Helvetica-Bold",14)
+        c.drawString(20*mm, H-20*mm, "FLAI - Report Movimenti")
+        c.setFont("Helvetica",10)
+        c.drawString(20*mm, H-26*mm, f"Periodo: {df or '-'} → {dt or '-'}  |  type={type_ or 'tutti'}  q={q or ''}")
+        c.setFont("Helvetica-Bold",11)
+        c.drawString(20*mm, H-36*mm, f"Entrate: {totals['in']:.2f}  Uscite: {totals['out']:.2f}  Netto: {totals['net']:.2f}")
+
+        y = H-46*mm
+        c.setFont("Helvetica-Bold",9)
+        c.drawString(20*mm,y,"ID"); c.drawString(35*mm,y,"Tipo"); c.drawString(55*mm,y,"Importo")
+        c.drawString(85*mm,y,"Valuta"); c.drawString(105*mm,y,"Categoria"); c.drawString(145*mm,y,"Note"); c.drawString(190*mm,y,"Data")
+        y -= 6*mm; c.setFont("Helvetica",9)
+        for m in items:
+            if y < 20*mm: c.showPage(); y = H-20*mm; c.setFont("Helvetica",9)
+            c.drawString(20*mm,y,str(m["id"]))
+            c.drawString(35*mm,y,m["type"])
+            c.drawRightString(82*mm,y,f"{m['amount']:.2f}")
+            c.drawString(85*mm,y,m["currency"])
+            c.drawString(105*mm,y,(m["category"] or "")[:18])
+            c.drawString(145*mm,y,(m["note"] or "")[:30])
+            c.drawRightString(200*mm,y,m["created_at"])
+            y -= 6*mm
+
+        c.showPage(); c.save(); buf.seek(0)
+        return StreamingResponse(buf, media_type="application/pdf",
+            headers={"Content-Disposition": 'inline; filename="flai-report.pdf"'})
+    except Exception as e:
+        return JSONResponse({"error":"pdf_failed","detail":str(e)}, status_code=500)
+# ====================== /DASHBOARD ======================
+
