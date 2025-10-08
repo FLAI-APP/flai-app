@@ -908,7 +908,7 @@ from decimal import Decimal
 
 BRAND_BLUE = os.getenv("BRAND_BLUE", "#000A22")
 ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#AA8F15")
-LOGO_URL    = (os.getenv("LOGO_URL", "") or "").strip()
+LOGO_URL    = os.getenv("LOGO_URL", "").strip()
 GITHUB_REPO = (os.getenv("GITHUB_REPO", "FLAI-APP/flai-app") or "").strip("/")
 # Se LOGO_URL è relativo (refs/heads/...), trasformalo in raw GitHub
 if LOGO_URL and not LOGO_URL.startswith(("http://","https://")):
