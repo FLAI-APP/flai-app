@@ -899,7 +899,7 @@ async def email_report(
 # === FINE EMAIL ===============================================================
 
 
-# === DASHBOARD (HTML + API dati + PDF) ========================================
+# === DASHBOARD (HTML + API + PDF) =============================================
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi import Request, HTTPException, Query
 import os, io
@@ -908,19 +908,13 @@ from decimal import Decimal
 
 BRAND_BLUE = os.getenv("BRAND_BLUE", "#000A22")
 ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#AA8F15")
-LOGO_URL    = os.getenv("LOGO_URL", "").strip()
+LOGO_URL    = (os.getenv("LOGO_URL", "") or "").strip()
+# se l'URL è relativo tipo "refs/heads/main/..." lo trasformo in raw GitHub
+if LOGO_URL and not LOGO_URL.startswith(("http://","https://")):
+    repo = os.getenv("GITHUB_REPO", "FLAI-APP/flai-app").strip("/")  # owner/repo
+    LOGO_URL = f"https://raw.githubusercontent.com/{repo}/{LOGO_URL.lstrip('/')}"
 
-# usa get_conn() esistente
-try:
-    get_conn  # type: ignore
-except NameError:
-    import psycopg
-    def get_conn():
-        url = os.getenv("DATABASE_URL", "")
-        if not url:
-            raise RuntimeError("DATABASE_URL not set")
-        return psycopg.connect(url, row_factory=psycopg.rows.dict_row)
-
+# usa get_conn() già esistente
 def _iso_or_none(s: str | None) -> dt.date | None:
     if not s: return None
     try: return dt.date.fromisoformat(s)
@@ -954,8 +948,10 @@ def _fetch_dashboard_rows(conn, d_from, d_to, typ, q, limit=100000):
         params += [like]*7
     sql += " ORDER BY created_at DESC, id DESC LIMIT %s"
     params.append(limit)
-    with conn.cursor() as c:
-        c.execute(sql, params); return c.fetchall()
+    with get_conn() as c:  # get_conn è già definita sopra nel file
+        with c.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
 
 @APP.get("/dashboard", response_class=HTMLResponse)  # type: ignore
 async def dashboard(request: Request) -> HTMLResponse:
@@ -971,17 +967,17 @@ async def dashboard(request: Request) -> HTMLResponse:
 *{{box-sizing:border-box}}
 body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.35 -apple-system,Segoe UI,Roboto,system-ui,sans-serif}}
 .header{{background:var(--brand);padding:10px 16px;display:flex;align-items:center;gap:12px}}
-.logo{{width:28px;height:28px;border-radius:6px;background:#12203a;overflow:hidden;filter:brightness(0.70)}}
+.logo{{width:28px;height:28px;border-radius:6px;overflow:hidden;filter:brightness(0.68)}}
 .logo img{{width:100%;height:100%;object-fit:cover}}
 .title{{font-weight:700;letter-spacing:.3px}}
 .wrap{{max-width:1280px;margin:18px auto;padding:0 16px}}
 
-.filters{{display:grid;grid-template-columns:auto auto auto 1fr auto auto;gap:10px;align-items:center}}
-label{{color:var(--muted);font-size:12px;margin-right:6px}}
+.filters{{display:flex;align-items:center;gap:10px;flex-wrap:nowrap;overflow:auto}}
+.filters label{{color:var(--muted);font-size:12px;margin-right:6px;white-space:nowrap}}
 input[type=date],select,input[type=text]{{background:var(--panel);color:var(--text);border:1px solid #324158;border-radius:12px;padding:10px 12px}}
 select.pill{{appearance:none;padding-right:28px;border-radius:12px}}
-input#q{{width:260px}} /* barra più corta per tenere tutto in una riga */
-.btn{{background:var(--accent);color:#111;border:0;border-radius:12px;padding:10px 12px;font-weight:700;cursor:pointer}}
+input#q{{width:400px;max-width:400px;flex:0 0 400px}} /* barra più corta per stare su una riga */
+.btn{{background:var(--accent);color:#111;border:0;border-radius:12px;padding:10px 12px;font-weight:700;cursor:pointer;white-space:nowrap}}
 .btn:active{{transform:translateY(1px)}}
 
 .stats{{display:flex;gap:14px;margin:14px 0 16px}}
@@ -1098,10 +1094,12 @@ async function loadData() {{
 document.getElementById('apply').addEventListener('click', loadData);
 document.getElementById('pdf').addEventListener('click', () => {{
   const u = currentQuery(); u.pathname = '/dashboard/pdf';
-  // forza download
-  window.location.href = u.toString();
+  // forza download senza aprire nuova pagina
+  const a = document.createElement('a');
+  a.href = u.toString(); a.download = 'flai-report.pdf';
+  document.body.appendChild(a); a.click(); a.remove();
 }});
-loadData(); // non setto default: se lasci vuote le date, vedi tutto (il browser può precompilare)
+loadData();
 </script>
 </body></html>"""
     return HTMLResponse(html)
@@ -1145,51 +1143,55 @@ async def dashboard_pdf(
     d_to   = _iso_or_none(to)
     if type not in (None, "", "in", "out"):
         raise HTTPException(status_code=400, detail="invalid type")
-    with get_conn() as conn:
-        rows = _fetch_dashboard_rows(conn, d_from, d_to, type, q, limit=100000)
 
-    buff = io.BytesIO()
     try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.units import mm
-        width, height = A4
-        c = canvas.Canvas(buff, pagesize=A4)
-        y = height - 20*mm
-        title = "FLAI – Report"
-        if d_from or d_to: title += f" ({d_from or ''} → {d_to or ''})"
-        if type: title += f" · {type}"
-        if q:    title += f" · filtro: {q}"
-        c.setFont("Helvetica-Bold", 14); c.drawString(20*mm, y, title); y -= 10*mm
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(20*mm,y,"ID"); c.drawString(35*mm,y,"TP")
-        c.drawString(45*mm,y,"AMOUNT"); c.drawString(75*mm,y,"CUR")
-        c.drawString(90*mm,y,"CATEGORY"); c.drawString(140*mm,y,"NOTE"); y -= 6*mm
-        c.setFont("Helvetica", 10)
-        s_in = Decimal("0"); s_out = Decimal("0")
-        for r in rows:
-            amt = Decimal(str(r["amount"]))
-            if r["type"] == "in": s_in += amt
-            else: s_out += amt
-            if y < 20*mm: c.showPage(); y = height - 20*mm; c.setFont("Helvetica",10)
-            c.drawString(20*mm,y,str(r["id"]))
-            c.drawString(35*mm,y,r["type"])
-            c.drawRightString(72*mm,y,f"{amt:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-            c.drawString(75*mm,y,r["currency"])
-            c.drawString(90*mm,y,(r["category"] or "")[:24])
-            c.drawString(140*mm,y,(r["note"] or "")[:38])
-            y -= 5.5*mm
-        y -= 6*mm; c.setFont("Helvetica-Bold",11)
-        net = s_in - s_out
-        c.drawString(20*mm,y,f"Entrate: {s_in:.2f}  •  Uscite: {s_out:.2f}  •  Netto: {net:.2f}")
-        c.save()
-        pdf_bytes = buff.getvalue()
-        fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
-        return StreamingResponse(io.BytesIO(pdf_bytes), media_type="application/pdf",
-                                 headers={{"Content-Disposition": f'attachment; filename="{fname}"'}})
-    except Exception:
-        txt = "\n".join([f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}" for r in rows])
-        fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
-        return StreamingResponse(io.BytesIO(txt.encode("utf-8")), media_type="text/plain",
-                                 headers={{"Content-Disposition": f'attachment; filename="{fname}"'}})
+        with get_conn() as conn:
+            rows = _fetch_dashboard_rows(conn, d_from, d_to, type, q, limit=100000)
+
+        buf = io.BytesIO()
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.units import mm
+            width, height = A4
+            c = canvas.Canvas(buf, pagesize=A4)
+            y = height - 20*mm
+            title = "FLAI – Report"
+            if d_from or d_to: title += f" ({d_from or ''} → {d_to or ''})"
+            if type: title += f" · {type}"
+            if q:    title += f" · filtro: {q}"
+            c.setFont("Helvetica-Bold", 14); c.drawString(20*mm, y, title); y -= 10*mm
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(20*mm,y,"ID"); c.drawString(35*mm,y,"TP")
+            c.drawString(45*mm,y,"AMOUNT"); c.drawString(75*mm,y,"CUR")
+            c.drawString(90*mm,y,"CATEGORY"); c.drawString(140*mm,y,"NOTE"); y -= 6*mm
+            c.setFont("Helvetica", 10)
+            s_in = Decimal("0"); s_out = Decimal("0")
+            for r in rows:
+                amt = Decimal(str(r["amount"]))
+                if r["type"] == "in": s_in += amt
+                else: s_out += amt
+                if y < 20*mm: c.showPage(); y = height - 20*mm; c.setFont("Helvetica",10)
+                c.drawString(20*mm,y,str(r["id"]))
+                c.drawString(35*mm,y,r["type"])
+                c.drawRightString(72*mm,y,f"{amt:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+                c.drawString(75*mm,y,r["currency"])
+                c.drawString(90*mm,y,(r["category"] or "")[:24])
+                c.drawString(140*mm,y,(r["note"] or "")[:38])
+                y -= 5.5*mm
+            y -= 6*mm; c.setFont("Helvetica-Bold",11)
+            net = s_in - s_out
+            c.drawString(20*mm,y,f"Entrate: {s_in:.2f}  •  Uscite: {s_out:.2f}  •  Netto: {net:.2f}")
+            c.save()
+            pdf_bytes = buf.getvalue()
+            fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
+            return StreamingResponse(io.BytesIO(pdf_bytes), media_type="application/pdf",
+                                     headers={{"Content-Disposition": f'attachment; filename="{fname}"'}})
+        except Exception:
+            txt = "\n".join([f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}" for r in rows])
+            fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
+            return StreamingResponse(io.BytesIO(txt.encode("utf-8")), media_type="text/plain",
+                                     headers={{"Content-Disposition": f'attachment; filename="{fname}"'}})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 # === FINE DASHBOARD ============================================================
