@@ -1202,3 +1202,32 @@ async def dashboard_pdf(
         return Response(content=txt.encode("utf-8"), media_type="text/plain",
                         headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 # === FINE DASHBOARD ============================================================
+
+from typing import Optional, Literal
+from decimal import Decimal
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field, constr
+
+class MovementIn(BaseModel):
+    type: Literal["in","out"] = Field(..., description="in = entrata, out = uscita")
+    amount: Decimal = Field(..., gt=0)
+    currency: constr(min_length=3, max_length=3) = "CHF"
+    category: Optional[str] = None
+    note: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+@APP.post("/api/movements")
+def create_movement(m: MovementIn):
+    dt = m.created_at or datetime.now(timezone.utc)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO movements(type, amount, currency, category, note, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id, created_at
+            """,
+            (m.type, m.amount, m.currency.upper(), m.category, m.note, dt)
+        )
+        row = dict(cur.fetchone())
+        conn.commit()
+    return {"ok": True, "id": row["id"], "created_at": row["created_at"].isoformat()}
