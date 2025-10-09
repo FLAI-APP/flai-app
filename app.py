@@ -915,7 +915,6 @@ GITHUB_REPO = (os.getenv("GITHUB_REPO", "FLAI-APP/flai-app") or "").strip("/")
 if LOGO_URL and not LOGO_URL.startswith(("http://","https://")):
     LOGO_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{LOGO_URL.lstrip('/')}"
 
-# >>> FIX LOGO: prepara il tag già interpolato (non stringa letterale con {LOGO_URL})
 LOGO_TAG = f'<img src="{LOGO_URL}" alt="logo"/>' if LOGO_URL else ''
 
 def _iso_or_none(s: str | None) -> dt.date | None:
@@ -950,7 +949,7 @@ def _fetch_dashboard_rows(conn, d_from, d_to, typ, q):
             TO_CHAR(created_at,'YYYY-MM-DD HH24:MI') ILIKE %s
         )"""
         params += [like]*7
-    sql += " ORDER BY created_at DESC, id DESC"   # <-- nessun LIMIT
+    sql += " ORDER BY created_at DESC, id DESC"
     with get_conn() as c:
         with c.cursor() as cur:
             cur.execute(sql, params)
@@ -962,6 +961,8 @@ async def dashboard(request: Request) -> HTMLResponse:
 <html lang="it"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>FLAI · Dashboard</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 :root {{
   --bg:#0b0f14; --panel:#1b2129; --panel2:#232b35; --text:#e6e7ea; --muted:#9aa4b2;
@@ -970,18 +971,17 @@ async def dashboard(request: Request) -> HTMLResponse:
 *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);
 font:15px/1.35 -apple-system,Segoe UI,Roboto,system-ui,sans-serif}}
 .header{{background:var(--brand);padding:10px 16px;display:flex;align-items:center;gap:12px}}
-.logo{{width:30px;height:30px;border-radius:6px;overflow:hidden;filter:brightness(0.72)}}
+.logo{{width:34px;height:34px;border-radius:8px;overflow:hidden;filter:brightness(0.62)}} /* logo un po' più scuro */
 .logo img{{width:100%;height:100%;object-fit:cover}}
-.title{{font-weight:700;letter-spacing:.3px}}
+.title{{font-weight:800;letter-spacing:.3px}}
 .wrap{{max-width:1280px;margin:18px auto;padding:0 16px}}
 
 .filters{{display:flex;align-items:center;gap:10px;flex-wrap:nowrap;overflow:auto}}
 .filters label{{color:var(--muted);font-size:12px;margin-right:6px;white-space:nowrap}}
 input[type=date],select,input[type=text]{{background:var(--panel);color:var(--text);
   border:1px solid #324158;border-radius:12px;padding:10px 12px}}
-select.pill{{appearance:none;padding-right:28px;border-radius:12px;
-  background:var(--panel);color:#cbd3df}}  /* “Tutti” grigio */
-input#q{{width:360px;max-width:360px;flex:0 0 360px}} /* barra più corta */
+select.pill{{appearance:none;padding-right:28px;border-radius:12px;background:var(--panel);color:#cbd3df}}
+input#q{{width:320px;max-width:320px;flex:0 0 320px}} /* barra più corta */
 .btn{{background:var(--accent);color:#111;border:0;border-radius:12px;padding:10px 12px;
   font-weight:700;cursor:pointer;white-space:nowrap}}
 .btn:active{{transform:translateY(1px)}}
@@ -997,16 +997,23 @@ th,td{{padding:12px 14px;text-align:left;border-bottom:1px solid #2b3545;white-s
 thead th{{color:#b9c2cf;font-size:12px;letter-spacing:.4px}}
 tbody tr:hover{{background:#1f2732}}
 th.col-id,td.col-id{{width:60px}}
-th.col-type,td.col-type{{width:80px}}
+th.col-type,td.col-type{{width:90px}}
 th.col-amt,td.col-amt{{width:120px;text-align:right}}
 th.col-cur,td.col-cur{{width:80px}}
-th.col-cat,td.col-cat{{width:180px}}
+th.col-cat,td.col-cat{{width:200px}}
 th.col-note,td.col-note{{width:260px;overflow:hidden;text-overflow:ellipsis}}
-th.col-date,td.col-date{{width:160px}}
+th.col-date,td.col-date{{width:170px}}
+
+.table-actions{{display:flex;justify-content:flex-end;padding:10px 0}}
+.link-like{{background:none;border:none;color:#8fb4ff;text-decoration:underline;cursor:pointer;font-weight:600}}
+
+.charts{{display:grid;grid-template-columns:1fr 420px;gap:16px;margin:18px 0}}
+.panel{{background:var(--panel2);border:1px solid #2f3b4c;border-radius:12px;padding:14px}}
+.panel h4{{margin:2px 0 10px;color:#b9c2cf;font-size:12px;letter-spacing:.5px}}
 </style></head>
 <body>
   <div class="header">
-    <div class="logo">{LOGO_TAG}</div>  <!-- <<< QUI il logo è interpolato correttamente -->
+    <div class="logo">{LOGO_TAG}</div>
     <div class="title">FLAI Dashboard</div>
   </div>
 
@@ -1046,9 +1053,26 @@ th.col-date,td.col-date{{width:160px}}
         <tbody></tbody>
       </table>
     </div>
+    <div class="table-actions">
+      <button id="showAll" class="link-like" style="display:none">Vedi tutto</button>
+    </div>
+
+    <div class="charts">
+      <div class="panel">
+        <h4>ANDAMENTO GIORNALIERO (Entrate vs Uscite)</h4>
+        <canvas id="lineChart" height="140"></canvas>
+      </div>
+      <div class="panel">
+        <h4>PESO ENTRATE vs USCITE</h4>
+        <canvas id="pieChart" height="140"></canvas>
+      </div>
+    </div>
   </div>
 
 <script>
+let FULL_ROWS = [];      // tutte le righe dal server
+let SHOW_LIMIT = 20;     // mostriamo 20 righe iniziali
+
 function money(v) {{
   try {{
     const n = Number(v);
@@ -1062,6 +1086,13 @@ function fmtDate(iso) {{
   const pad = (n)=>String(n).padStart(2,'0');
   return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes());
 }}
+function onlyDate(iso) {{
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n)=>String(n).padStart(2,'0');
+  return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());
+}}
 function currentQuery() {{
   const f = document.getElementById('from').value;
   const t = document.getElementById('to').value;
@@ -1074,17 +1105,12 @@ function currentQuery() {{
   if (q) u.searchParams.set('q', q);
   return u;
 }}
-async function loadData() {{
-  const url = currentQuery();
-  const res = await fetch(url);
-  if (!res.ok) {{ alert('Errore nel caricamento dati ('+res.status+')'); return; }}
-  const js = await res.json();
-  document.getElementById('sum_in').textContent  = money(js.sum_in)  + " CHF";
-  document.getElementById('sum_out').textContent = money(js.sum_out) + " CHF";
-  document.getElementById('sum_net').textContent = money(js.sum_net) + " CHF";
+
+function renderTable(rows, limit=SHOW_LIMIT) {{
   const tb = document.querySelector('#tbl tbody');
   tb.innerHTML = '';
-  for (const r of js.rows) {{
+  const slice = rows.slice(0, limit);
+  for (const r of slice) {{
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="col-id">${{r.id}}</td>
@@ -1096,13 +1122,94 @@ async function loadData() {{
       <td class="col-date">${{fmtDate(r.created_at)}}</td>`;
     tb.appendChild(tr);
   }}
+  const btn = document.getElementById('showAll');
+  btn.style.display = (rows.length > limit) ? 'inline' : 'none';
 }}
+
+let lineChart = null;
+let pieChart  = null;
+
+function renderCharts(rows, sum_in, sum_out) {{
+  // Aggrega per giorno
+  const mapIn = new Map();  // date -> somma in
+  const mapOut= new Map();  // date -> somma out
+  for (const r of rows) {{
+    const d = onlyDate(r.created_at);
+    const amt = Number(r.amount);
+    if (r.type === 'in')  mapIn.set(d, (mapIn.get(d)  || 0) + amt);
+    if (r.type === 'out') mapOut.set(d, (mapOut.get(d) || 0) + amt);
+  }}
+  const dates = Array.from(new Set([...mapIn.keys(), ...mapOut.keys()])).sort();
+  const dataIn = dates.map(d=> mapIn.get(d)  || 0);
+  const dataOut= dates.map(d=> mapOut.get(d) || 0);
+
+  // Line chart
+  const lc = document.getElementById('lineChart').getContext('2d');
+  if (lineChart) lineChart.destroy();
+  lineChart = new Chart(lc, {{
+    type: 'line',
+    data: {{
+      labels: dates,
+      datasets: [
+        {{label:'Entrate', data: dataIn, borderWidth:2, fill:false, tension:0.2}},
+        {{label:'Uscite',  data: dataOut, borderWidth:2, fill:false, tension:0.2}}
+      ]
+    }},
+    options: {{
+      responsive:true,
+      plugins: {{legend: {{labels: {{color:'#cbd3df'}}}},}},
+      scales: {{
+        x: {{ ticks: {{ color:'#cbd3df' }}, grid: {{ color:'#2b3545' }} }},
+        y: {{ ticks: {{ color:'#cbd3df' }}, grid: {{ color:'#2b3545' }} }}
+      }}
+    }}
+  }});
+
+  // Pie chart (Entrate vs Uscite)
+  const pc = document.getElementById('pieChart').getContext('2d');
+  if (pieChart) pieChart.destroy();
+  pieChart = new Chart(pc, {{
+    type: 'pie',
+    data: {{
+      labels: ['Entrate','Uscite'],
+      datasets: [{{ data: [Number(sum_in), Number(sum_out)] }}]
+    }},
+    options: {{
+      plugins: {{legend: {{labels: {{color:'#cbd3df'}}}}}}
+    }}
+  }});
+}}
+
+async function loadData() {{
+  const url = currentQuery();
+  const res = await fetch(url);
+  if (!res.ok) {{ alert('Errore nel caricamento dati ('+res.status+')'); return; }}
+  const js = await res.json();
+  FULL_ROWS = js.rows || [];
+
+  // Statistiche
+  document.getElementById('sum_in').textContent  = money(js.sum_in)  + " CHF";
+  document.getElementById('sum_out').textContent = money(js.sum_out) + " CHF";
+  document.getElementById('sum_net').textContent = money(js.sum_net) + " CHF";
+
+  // Tabella (prime 20)
+  renderTable(FULL_ROWS, SHOW_LIMIT);
+
+  // Grafici
+  renderCharts(FULL_ROWS, js.sum_in, js.sum_out);
+}}
+
 document.getElementById('apply').addEventListener('click', loadData);
 document.getElementById('pdf').addEventListener('click', () => {{
   const u = currentQuery(); u.pathname = '/dashboard/pdf';
   const a = document.createElement('a'); a.href = u.toString(); a.download = 'flai-report.pdf';
   document.body.appendChild(a); a.click(); a.remove();
 }});
+document.getElementById('showAll').addEventListener('click', () => {{
+  renderTable(FULL_ROWS, FULL_ROWS.length);
+  document.getElementById('showAll').style.display = 'none';
+}});
+
 loadData();
 </script>
 </body></html>"""
@@ -1151,7 +1258,7 @@ async def dashboard_pdf(
     with get_conn() as conn:
         rows = _fetch_dashboard_rows(conn, d_from, d_to, type, q)
 
-    # Prova PDF con reportlab, fallback .txt
+    # PDF semplice con reportlab; se manca reportlab -> fallback .txt
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.pdfgen import canvas
@@ -1199,12 +1306,12 @@ async def dashboard_pdf(
         pdf_bytes = buf.read()
         fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
         return Response(content=pdf_bytes, media_type="application/pdf",
-                        headers={{"Content-Disposition": f'attachment; filename="{fname}"'}})
+                        headers={"Content-Disposition": f'attachment; filename=\"{fname}\""})
     except Exception:
         txt = "\n".join([f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}" for r in rows])
         fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
         return Response(content=txt.encode("utf-8"), media_type="text/plain",
-                        headers={{"Content-Disposition": f'attachment; filename="{fname}"'}})
+                        headers={"Content-Disposition": f'attachment; filename=\"{fname}\""})
 # === FINE DASHBOARD ============================================================
 
 
