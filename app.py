@@ -58,30 +58,31 @@ APP.add_middleware(
 
 # -----------------------------------------------------------------------------
 
-# --- Sicurezza: API key solo per le vere API, NON per la dashboard ---
-API_KEY_APP = os.getenv("API_KEY_APP", "")
-
-# Rotte che restano protette (webhook, API vere ecc.)
-_PROTECTED_PREFIXES = ("/api/", "/webhook", "/whatsapp", "/email", "/reports")
-
-def _is_protected(path: str) -> bool:
-    # Tutto ciò che è dashboard resta aperto
-    if path.startswith("/dashboard"):  # /dashboard, /dashboard/data, /dashboard/pdf
-        return False
-    # eventualmente lascia aperte anche healthz e logo
-    if path in ("/", "/healthz", "/favicon.ico"):
-        return False
-    return any(path.startswith(p) for p in _PROTECTED_PREFIXES)
-
 @APP.middleware("http")
 async def security_and_rate_limit(request: Request, call_next):
-    path = request.url.path
-    # Se la rotta è protetta, serve API key
-    if _is_protected(path):
-        api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
-        if not api_key or api_key != API_KEY_APP:
-            raise HTTPException(status_code=401, detail="invalid api key")
-    # continua normale
+    # path senza eventuale slash finale ("/dashboard/" -> "/dashboard")
+    path = request.url.path.rstrip("/") or "/"
+
+    # Tutto ciò che serve al browser va lasciato passare
+    WHITELIST_PREFIXES = (
+        "/",                 # eventuale redirect alla dashboard
+        "/healthz",
+        "/dashboard",        # include /dashboard/data e /dashboard/pdf
+        "/static",
+        "/favicon.ico",
+        "/docs",
+        "/openapi.json",
+    )
+
+    if any(path == p or path.startswith(p + "/") for p in WHITELIST_PREFIXES):
+        return await call_next(request)
+
+    # Per il resto serve l'API key
+    expected = (os.getenv("API_KEY_APP") or "").strip()
+    got = (request.headers.get("X-API-Key") or "").strip()
+    if not expected or got != expected:
+        raise HTTPException(status_code=401, detail="invalid api key")
+
     return await call_next(request)
 
 # -----------------------------------------------------------------------------
