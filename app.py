@@ -707,7 +707,7 @@ async def report_pdf(
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+	    headers={"Content-Disposition": 'attachment; filename="{}"'.format(fname)}
         )
     except Exception as e:
         return {"error": "pdf_failed", "detail": str(e)}
@@ -785,71 +785,119 @@ def _fetch_movements_between(d_from: dt.date, d_to: dt.date, category: Optional[
     return rows
 
 def _make_pdf_report_bytes(
-    d_from: dt.date,
-    d_to: dt.date,
-    category: Optional[str],
+    rows: list[dict],
+    d_from: dt.date | None,
+    d_to: dt.date | None,
+    title_suffix: str = "",
 ) -> bytes:
     """
-    PDF minimale ma leggibile: intestazione, totali, e tabellina movimenti.
+    Genera un PDF identico per Dashboard e Email.
+    rows: lista di dict con chiavi: id, type, amount, currency, category, note, created_at (datetime)
     """
-    movements = _fetch_movements_between(d_from, d_to, category)
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+    from reportlab.lib.colors import black
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
+
     width, height = A4
     margin = 15 * mm
     x = margin
     y = height - margin
 
-    # Header
+    # ---------- Header ----------
     c.setFillColor(black)
     c.setFont("Helvetica-Bold", 16)
-    title = "FLAI – Report movimenti"
-    if category:
-        title += f" (categoria: {category})"
-    c.drawString(x, y, title); y -= 10 * mm
-
-    c.setFont("Helvetica", 11)
-    c.drawString(x, y, f"Periodo: {d_from.isoformat()} → {d_to.isoformat()}"); y -= 7 * mm
-
-    # Totali
-    tot_in = sum(r["amount"] for r in movements if r["type"] == "in")
-    tot_out = sum(r["amount"] for r in movements if r["type"] == "out")
-    tot_net = tot_in - tot_out
-    cur = movements[0]["currency"] if movements else "CHF"
-    c.drawString(x, y, f"Totale entrate: {tot_in:.2f} {cur}   •   Totale uscite: {tot_out:.2f} {cur}   •   Netto: {tot_net:.2f} {cur}")
+    title = "FLAI – Report"
+    if title_suffix:
+        title += f" · {title_suffix}"
+    if d_from or d_to:
+        df = d_from.isoformat() if d_from else "…"
+        dt_ = d_to.isoformat() if d_to else "…"
+        title += f" ({df} → {dt_})"
+    c.drawString(x, y, title)
     y -= 10 * mm
 
-    # Tabella
+    # ---------- Totali ----------
+    from decimal import Decimal
+    s_in = Decimal("0")
+    s_out = Decimal("0")
+    currency = ""
+    for r in rows:
+        amt = Decimal(str(r["amount"]))
+        if r["type"] == "in":
+            s_in += amt
+        else:
+            s_out += amt
+        if not currency:
+            currency = r.get("currency", "")
+
+    net = s_in - s_out
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(
+        x,
+        y,
+        f"Entrate: {s_in:,.2f} {currency}   •   Uscite: {s_out:,.2f} {currency}   •   Netto: {net:,.2f} {currency}".replace(
+            ",", "X"
+        ).replace(".", ",").replace("X", ".")
+    )
+    y -= 8 * mm
+
+    # ---------- Intestazioni tabella ----------
     c.setFont("Helvetica-Bold", 10)
-    c.drawString(x, y, "Data")
-    c.drawString(x + 28*mm, y, "Tipo")
-    c.drawString(x + 45*mm, y, "Importo")
-    c.drawString(x + 75*mm, y, "Cat.")
-    c.drawString(x + 105*mm, y, "Nota")
-    y -= 5 * mm
+    c.drawString(x + 0 * mm, y, "ID")
+    c.drawString(x + 14 * mm, y, "TP")
+    c.drawString(x + 26 * mm, y, "AMOUNT")
+    c.drawString(x + 55 * mm, y, "CUR")
+    c.drawString(x + 70 * mm, y, "CATEGORY")
+    c.drawString(x + 120 * mm, y, "NOTE")
+    c.drawString(x + 170 * mm, y, "CREATED AT")
+    y -= 5.5 * mm
+
     c.setFont("Helvetica", 10)
+
+    def fmt_money(v: Decimal) -> str:
+        return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    def fmt_date(dv) -> str:
+        try:
+            return dv.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(dv)
 
     rows_per_page = int((y - margin) // (5.5 * mm))
     i = 0
-    for r in movements:
+    for r in rows:
         if i and i % rows_per_page == 0:
             c.showPage()
-            c.setFillColor(black); c.setFont("Helvetica", 10)
             y = height - margin
-        date_s = r["created_at"].strftime("%Y-%m-%d")
-        c.drawString(x, y, date_s)
-        c.drawString(x + 28*mm, y, "Entrata" if r["type"] == "in" else "Uscita")
-        c.drawRightString(x + 72*mm, y, f'{r["amount"]:.2f} {r["currency"]}')
-        c.drawString(x + 75*mm, y, (r["category"] or "")[:18])
-        c.drawString(x + 105*mm, y, (r["note"] or "")[:40])
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(x + 0 * mm, y, "ID")
+            c.drawString(x + 14 * mm, y, "TP")
+            c.drawString(x + 26 * mm, y, "AMOUNT")
+            c.drawString(x + 55 * mm, y, "CUR")
+            c.drawString(x + 70 * mm, y, "CATEGORY")
+            c.drawString(x + 120 * mm, y, "NOTE")
+            c.drawString(x + 170 * mm, y, "CREATED AT")
+            y -= 5.5 * mm
+            c.setFont("Helvetica", 10)
+
+        amt = Decimal(str(r["amount"]))
+        c.drawString(x + 0 * mm, y, str(r["id"]))
+        c.drawString(x + 14 * mm, y, r.get("type", ""))
+        c.drawRightString(x + 52 * mm, y, fmt_money(amt))
+        c.drawString(x + 55 * mm, y, r.get("currency", ""))
+        c.drawString(x + 70 * mm, y, (r.get("category") or "")[:46])
+        c.drawString(x + 120 * mm, y, (r.get("note") or "")[:46])
+        c.drawString(x + 170 * mm, y, fmt_date(r.get("created_at")))
         y -= 5.5 * mm
         i += 1
 
-    if not movements:
+    if not rows:
         c.drawString(x, y, "Nessun movimento nel periodo selezionato.")
 
-    c.showPage()
     c.save()
     return buf.getvalue()
 
@@ -906,16 +954,15 @@ import os, io
 import datetime as dt
 from decimal import Decimal
 
+# Brand & logo
 BRAND_BLUE = os.getenv("BRAND_BLUE", "#000A22")
 ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#AA8F15")
-LOGO_URL    = os.getenv("LOGO_URL", "").strip()
+LOGO_URL    = (os.getenv("LOGO_URL", "") or "").strip()
 GITHUB_REPO = (os.getenv("GITHUB_REPO", "FLAI-APP/flai-app") or "").strip("/")
 
-# Se LOGO_URL è relativo (refs/heads/... o path nel repo), trasformalo in raw GitHub
-if LOGO_URL and not LOGO_URL.startswith(("http://","https://")):
+# Se LOGO_URL è relativo (refs/heads/...), trasformalo in raw GitHub (rimane un URL esterno)
+if LOGO_URL and not LOGO_URL.startswith(("http://", "https://")):
     LOGO_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{LOGO_URL.lstrip('/')}"
-
-LOGO_TAG = f'<img src="{LOGO_URL}" alt="logo"/>' if LOGO_URL else ''
 
 def _iso_or_none(s: str | None) -> dt.date | None:
     if not s: return None
@@ -949,11 +996,90 @@ def _fetch_dashboard_rows(conn, d_from, d_to, typ, q):
             TO_CHAR(created_at,'YYYY-MM-DD HH24:MI') ILIKE %s
         )"""
         params += [like]*7
-    sql += " ORDER BY created_at DESC, id DESC"
+    sql += " ORDER BY created_at DESC, id DESC"   # nessun LIMIT lato server
     with get_conn() as c:
         with c.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchall()
+
+# ---------- PDF riusabile (Dashboard + Email) ----------
+def _build_report_pdf(rows, d_from=None, d_to=None, typ=None, q=None) -> tuple[bytes, str]:
+    """
+    Ritorna (pdf_bytes, filename). Usa ReportLab. Stesso PDF per dashboard ed email.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import mm
+    from reportlab.lib.colors import HexColor
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    y = height - 22*mm
+
+    # Titolo
+    title = "FLAI – Report"
+    parts = []
+    if d_from or d_to: parts.append(f"{d_from or ''} → {d_to or ''}")
+    if typ: parts.append(typ)
+    if q:   parts.append(f"filtro: {q}")
+    if parts: title += " [" + " · ".join(parts) + "]"
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(20*mm, y, title)
+    y -= 10*mm
+
+    # Header tabella
+    c.setFont("Helvetica-Bold", 10)
+    c.setFillColor(HexColor("#444"))
+    c.rect(18*mm, y-3.5*mm, width-36*mm, 8*mm, stroke=0, fill=1)
+    c.setFillColor(HexColor("#fff"))
+    lefts = [20, 35, 55, 85, 105, 150]  # colonne in mm
+    heads = ["ID", "TP", "AMOUNT", "CUR", "CATEGORY", "NOTE"]
+    for x, h in zip(lefts, heads):
+        c.drawString(x*mm, y, h)
+    y -= 7*mm
+
+    # Righe
+    c.setFont("Helvetica", 10)
+    c.setFillColor(HexColor("#000"))
+    s_in = Decimal("0"); s_out = Decimal("0")
+    for r in rows:
+        amt = Decimal(str(r["amount"]))
+        if r["type"] == "in": s_in += amt
+        else: s_out += amt
+
+        if y < 20*mm:
+            c.showPage(); y = height - 22*mm
+            c.setFont("Helvetica-Bold", 10)
+            c.setFillColor(HexColor("#444"))
+            c.rect(18*mm, y-3.5*mm, width-36*mm, 8*mm, stroke=0, fill=1)
+            c.setFillColor(HexColor("#fff"))
+            for x, h in zip(lefts, heads):
+                c.drawString(x*mm, y, h)
+            y -= 7*mm
+            c.setFont("Helvetica", 10)
+            c.setFillColor(HexColor("#000"))
+
+        # Print values
+        c.drawString(20*mm, y, str(r["id"]))
+        c.drawString(35*mm, y, r["type"])
+        c.drawRightString(82*mm, y, f"{amt:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
+        c.drawString(85*mm, y, r["currency"])
+        c.drawString(105*mm, y, (r["category"] or "")[:30])
+        c.drawString(150*mm, y, (r["note"] or "")[:40])
+        y -= 5.2*mm
+
+    # Totali
+    net = s_in - s_out
+    y -= 6*mm
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(20*mm, y, f"Entrate: {s_in:.2f}  •  Uscite: {s_out:.2f}  •  Netto: {net:.2f}")
+
+    c.save()
+    buf.seek(0)
+    fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
+    return buf.read(), fname
 
 @APP.get("/dashboard", response_class=HTMLResponse)  # type: ignore
 async def dashboard(request: Request) -> HTMLResponse:
@@ -961,8 +1087,6 @@ async def dashboard(request: Request) -> HTMLResponse:
 <html lang="it"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>FLAI · Dashboard</title>
-<link rel="preconnect" href="https://cdn.jsdelivr.net"/>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 :root {{
   --bg:#0b0f14; --panel:#1b2129; --panel2:#232b35; --text:#e6e7ea; --muted:#9aa4b2;
@@ -971,17 +1095,18 @@ async def dashboard(request: Request) -> HTMLResponse:
 *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);
 font:15px/1.35 -apple-system,Segoe UI,Roboto,system-ui,sans-serif}}
 .header{{background:var(--brand);padding:10px 16px;display:flex;align-items:center;gap:12px}}
-.logo{{width:34px;height:34px;border-radius:8px;overflow:hidden;filter:brightness(0.62)}} /* logo un po' più scuro */
+.logo{{width:30px;height:30px;border-radius:6px;overflow:hidden;filter:brightness(0.60)}}
 .logo img{{width:100%;height:100%;object-fit:cover}}
-.title{{font-weight:800;letter-spacing:.3px}}
+.title{{font-weight:700;letter-spacing:.3px}}
 .wrap{{max-width:1280px;margin:18px auto;padding:0 16px}}
 
-.filters{{display:flex;align-items:center;gap:10px;flex-wrap:nowrap;overflow:auto}}
+.filters{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
 .filters label{{color:var(--muted);font-size:12px;margin-right:6px;white-space:nowrap}}
 input[type=date],select,input[type=text]{{background:var(--panel);color:var(--text);
   border:1px solid #324158;border-radius:12px;padding:10px 12px}}
-select.pill{{appearance:none;padding-right:28px;border-radius:12px;background:var(--panel);color:#cbd3df}}
-input#q{{width:320px;max-width:320px;flex:0 0 320px}} /* barra più corta */
+select.pill{{appearance:none;padding-right:28px;border-radius:12px;
+  background:var(--panel);color:#cbd3df}}  /* “Tutti” grigio */
+input#q{{width:380px;max-width:50vw;flex:0 0 380px}}
 .btn{{background:var(--accent);color:#111;border:0;border-radius:12px;padding:10px 12px;
   font-weight:700;cursor:pointer;white-space:nowrap}}
 .btn:active{{transform:translateY(1px)}}
@@ -997,23 +1122,21 @@ th,td{{padding:12px 14px;text-align:left;border-bottom:1px solid #2b3545;white-s
 thead th{{color:#b9c2cf;font-size:12px;letter-spacing:.4px}}
 tbody tr:hover{{background:#1f2732}}
 th.col-id,td.col-id{{width:60px}}
-th.col-type,td.col-type{{width:90px}}
+th.col-type,td.col-type{{width:80px}}
 th.col-amt,td.col-amt{{width:120px;text-align:right}}
 th.col-cur,td.col-cur{{width:80px}}
-th.col-cat,td.col-cat{{width:200px}}
+th.col-cat,td.col-cat{{width:180px}}
 th.col-note,td.col-note{{width:260px;overflow:hidden;text-overflow:ellipsis}}
-th.col-date,td.col-date{{width:170px}}
+th.col-date,td.col-date{{width:160px}}
 
-.table-actions{{display:flex;justify-content:flex-end;padding:10px 0}}
-.link-like{{background:none;border:none;color:#8fb4ff;text-decoration:underline;cursor:pointer;font-weight:600}}
-
-.charts{{display:grid;grid-template-columns:1fr 420px;gap:16px;margin:18px 0}}
-.panel{{background:var(--panel2);border:1px solid #2f3b4c;border-radius:12px;padding:14px}}
-.panel h4{{margin:2px 0 10px;color:#b9c2cf;font-size:12px;letter-spacing:.5px}}
-</style></head>
+.controls{{display:flex;justify-content:flex-end;margin-top:10px;gap:10px}}
+.chartbox{{background:var(--panel2);border:1px solid #2f3b4c;border-radius:12px;padding:14px;margin-top:16px}}
+.chartbox h4{{margin:0 0 10px;color:#b9c2cf;font-weight:600;font-size:12px;letter-spacing:.5px}}
+</style>
+</head>
 <body>
   <div class="header">
-    <div class="logo">{LOGO_TAG}</div>
+    <div class="logo">{('<img src="{LOGO_URL}" alt="logo"/>') if LOGO_URL else ''}</div>
     <div class="title">FLAI Dashboard</div>
   </div>
 
@@ -1053,25 +1176,28 @@ th.col-date,td.col-date{{width:170px}}
         <tbody></tbody>
       </table>
     </div>
-    <div class="table-actions">
-      <button id="showAll" class="link-like" style="display:none">Vedi tutto</button>
+
+    <div class="controls">
+      <button id="toggleRows" class="btn">Vedi tutto</button>
     </div>
 
-    <div class="charts">
-      <div class="panel">
-        <h4>ANDAMENTO GIORNALIERO (Entrate vs Uscite)</h4>
-        <canvas id="lineChart" height="140"></canvas>
-      </div>
-      <div class="panel">
-        <h4>PESO ENTRATE vs USCITE</h4>
-        <canvas id="pieChart" height="140"></canvas>
-      </div>
+    <div class="chartbox">
+      <h4>ANDAMENTO GIORNALIERO</h4>
+      <canvas id="lineChart" height="110"></canvas>
+    </div>
+    <div class="chartbox">
+      <h4>PESO ENTRATE / USCITE</h4>
+      <canvas id="pieChart" height="110"></canvas>
     </div>
   </div>
 
+<!-- Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" integrity="" crossorigin="anonymous"></script>
 <script>
-let FULL_ROWS = [];      // tutte le righe dal server
-let SHOW_LIMIT = 20;     // mostriamo 20 righe iniziali
+const ROW_LIMIT = 20;
+let fullRows = [];  // tutte le righe
+let showingAll = false;
+let lineChart, pieChart;
 
 function money(v) {{
   try {{
@@ -1086,13 +1212,6 @@ function fmtDate(iso) {{
   const pad = (n)=>String(n).padStart(2,'0');
   return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes());
 }}
-function onlyDate(iso) {{
-  if (!iso) return '';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const pad = (n)=>String(n).padStart(2,'0');
-  return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());
-}}
 function currentQuery() {{
   const f = document.getElementById('from').value;
   const t = document.getElementById('to').value;
@@ -1105,12 +1224,11 @@ function currentQuery() {{
   if (q) u.searchParams.set('q', q);
   return u;
 }}
-
-function renderTable(rows, limit=SHOW_LIMIT) {{
+function renderTable() {{
   const tb = document.querySelector('#tbl tbody');
   tb.innerHTML = '';
-  const slice = rows.slice(0, limit);
-  for (const r of slice) {{
+  const rows = showingAll ? fullRows : fullRows.slice(0, ROW_LIMIT);
+  for (const r of rows) {{
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="col-id">${{r.id}}</td>
@@ -1122,94 +1240,86 @@ function renderTable(rows, limit=SHOW_LIMIT) {{
       <td class="col-date">${{fmtDate(r.created_at)}}</td>`;
     tb.appendChild(tr);
   }}
-  const btn = document.getElementById('showAll');
-  btn.style.display = (rows.length > limit) ? 'inline' : 'none';
+  document.getElementById('toggleRows').textContent = showingAll ? 'Mostra meno' : 'Vedi tutto';
 }}
-
-let lineChart = null;
-let pieChart  = null;
-
-function renderCharts(rows, sum_in, sum_out) {{
-  // Aggrega per giorno
-  const mapIn = new Map();  // date -> somma in
-  const mapOut= new Map();  // date -> somma out
+function buildSeries(rows) {{
+  // somma per giorno
+  const mapIn = new Map(), mapOut = new Map();
   for (const r of rows) {{
-    const d = onlyDate(r.created_at);
-    const amt = Number(r.amount);
-    if (r.type === 'in')  mapIn.set(d, (mapIn.get(d)  || 0) + amt);
-    if (r.type === 'out') mapOut.set(d, (mapOut.get(d) || 0) + amt);
+    const d = (r.created_at || '').slice(0,10); // YYYY-MM-DD
+    if (!d) continue;
+    const amt = Number(r.amount||0);
+    const m = (r.type === 'in') ? mapIn : mapOut;
+    m.set(d, (m.get(d)||0) + amt);
   }}
-  const dates = Array.from(new Set([...mapIn.keys(), ...mapOut.keys()])).sort();
-  const dataIn = dates.map(d=> mapIn.get(d)  || 0);
-  const dataOut= dates.map(d=> mapOut.get(d) || 0);
+  const days = Array.from(new Set([...mapIn.keys(), ...mapOut.keys()])).sort();
+  const inVals = days.map(d => mapIn.get(d)||0);
+  const outVals = days.map(d => mapOut.get(d)||0);
+  return {{ days, inVals, outVals }};
+}}
+function renderCharts() {{
+  const {{days, inVals, outVals}} = buildSeries(fullRows);
 
-  // Line chart
-  const lc = document.getElementById('lineChart').getContext('2d');
   if (lineChart) lineChart.destroy();
-  lineChart = new Chart(lc, {{
+  const ctxL = document.getElementById('lineChart');
+  lineChart = new Chart(ctxL, {{
     type: 'line',
     data: {{
-      labels: dates,
+      labels: days,
       datasets: [
-        {{label:'Entrate', data: dataIn, borderWidth:2, fill:false, tension:0.2}},
-        {{label:'Uscite',  data: dataOut, borderWidth:2, fill:false, tension:0.2}}
+        {{ label: 'Entrate', data: inVals, tension: .3 }},
+        {{ label: 'Uscite',  data: outVals, tension: .3 }}
       ]
     }},
     options: {{
-      responsive:true,
-      plugins: {{legend: {{labels: {{color:'#cbd3df'}}}},}},
+      responsive: true,
+      plugins: {{ legend: {{ labels: {{ color: '#cbd3df' }} }} }},
       scales: {{
-        x: {{ ticks: {{ color:'#cbd3df' }}, grid: {{ color:'#2b3545' }} }},
-        y: {{ ticks: {{ color:'#cbd3df' }}, grid: {{ color:'#2b3545' }} }}
+        x: {{ ticks: {{ color: '#9aa4b2' }} }},
+        y: {{ ticks: {{ color: '#9aa4b2' }} }}
       }}
     }}
   }});
 
-  // Pie chart (Entrate vs Uscite)
-  const pc = document.getElementById('pieChart').getContext('2d');
+  const sumIn = inVals.reduce((a,b)=>a+b,0);
+  const sumOut = outVals.reduce((a,b)=>a+b,0);
+
   if (pieChart) pieChart.destroy();
-  pieChart = new Chart(pc, {{
+  const ctxP = document.getElementById('pieChart');
+  pieChart = new Chart(ctxP, {{
     type: 'pie',
     data: {{
-      labels: ['Entrate','Uscite'],
-      datasets: [{{ data: [Number(sum_in), Number(sum_out)] }}]
+      labels: ['Entrate', 'Uscite'],
+      datasets: [{{ data: [sumIn, sumOut] }}]
     }},
     options: {{
-      plugins: {{legend: {{labels: {{color:'#cbd3df'}}}}}}
+      responsive: true,
+      plugins: {{ legend: {{ labels: {{ color: '#cbd3df' }} }} }}
     }}
   }});
 }}
-
 async function loadData() {{
   const url = currentQuery();
   const res = await fetch(url);
   if (!res.ok) {{ alert('Errore nel caricamento dati ('+res.status+')'); return; }}
   const js = await res.json();
-  FULL_ROWS = js.rows || [];
-
-  // Statistiche
   document.getElementById('sum_in').textContent  = money(js.sum_in)  + " CHF";
   document.getElementById('sum_out').textContent = money(js.sum_out) + " CHF";
   document.getElementById('sum_net').textContent = money(js.sum_net) + " CHF";
-
-  // Tabella (prime 20)
-  renderTable(FULL_ROWS, SHOW_LIMIT);
-
-  // Grafici
-  renderCharts(FULL_ROWS, js.sum_in, js.sum_out);
+  fullRows = js.rows || [];
+  showingAll = false;
+  renderTable();
+  renderCharts();
 }}
-
 document.getElementById('apply').addEventListener('click', loadData);
+document.getElementById('toggleRows').addEventListener('click', () => {{
+  showingAll = !showingAll; renderTable();
+}});
 document.getElementById('pdf').addEventListener('click', () => {{
   const u = currentQuery(); u.pathname = '/dashboard/pdf';
   const a = document.createElement('a'); a.href = u.toString(); a.download = 'flai-report.pdf';
   document.body.appendChild(a); a.click(); a.remove();
 }});
-document.getElementById('showAll').addEventListener('click', () => {{
-  renderTable(FULL_ROWS, FULL_ROWS.length);
-  document.getElementById('showAll').style.display = 'none';
-}});
-
 loadData();
 </script>
 </body></html>"""
@@ -1240,7 +1350,10 @@ async def dashboard_data(
             "currency": r["currency"], "category": r["category"], "note": r["note"],
             "created_at": r["created_at"].isoformat() if hasattr(r["created_at"],"isoformat") else r["created_at"],
         })
-    return JSONResponse({"rows": out_rows, "sum_in": str(s_in), "sum_out": str(s_out), "sum_net": str(s_in - s_out)})
+    return JSONResponse({
+        "rows": out_rows,
+        "sum_in": str(s_in), "sum_out": str(s_out), "sum_net": str(s_in - s_out)
+    })
 
 @APP.get("/dashboard/pdf")  # type: ignore
 async def dashboard_pdf(
@@ -1255,64 +1368,34 @@ async def dashboard_pdf(
     if type not in (None, "", "in", "out"):
         raise HTTPException(status_code=400, detail="invalid type")
 
+    # prendi gli stessi dati mostrati a schermo
     with get_conn() as conn:
         rows = _fetch_dashboard_rows(conn, d_from, d_to, type, q)
 
-    # PDF semplice con reportlab; se manca reportlab -> fallback .txt
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.units import mm
+    # normalizza created_at a datetime quando serve
+    norm_rows = []
+    for r in rows:
+        rr = dict(r)
+        ca = rr.get("created_at")
+        if isinstance(ca, str):
+            try:
+                rr["created_at"] = dt.datetime.fromisoformat(ca)
+            except Exception:
+                pass
+        norm_rows.append(rr)
 
-        buf = io.BytesIO()
-        c = canvas.Canvas(buf, pagesize=A4)
-        width, height = A4
-        y = height - 20*mm
+    # usa il generatore PDF unico (lo stesso dell'email)
+    pdf_bytes = _make_pdf_report_bytes(norm_rows, d_from, d_to, title_suffix=(type or "").upper())
+    fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
 
-        title = "FLAI – Report"
-        if d_from or d_to: title += f" ({d_from or ''} → {d_to or ''})"
-        if type: title += f" · {type}"
-        if q:    title += f" · filtro: {q}"
-        c.setFont("Helvetica-Bold", 14); c.drawString(20*mm, y, title); y -= 10*mm
+    # header corretto (niente apici “strani” nell’f-string)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+    )
 
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(20*mm,y,"ID"); c.drawString(35*mm,y,"TP")
-        c.drawString(45*mm,y,"AMOUNT"); c.drawString(75*mm,y,"CUR")
-        c.drawString(90*mm,y,"CATEGORY"); c.drawString(140*mm,y,"NOTE"); y -= 6*mm
-
-        c.setFont("Helvetica", 10)
-        s_in = Decimal("0"); s_out = Decimal("0")
-        for r in rows:
-            amt = Decimal(str(r["amount"]))
-            if r["type"] == "in": s_in += amt
-            else: s_out += amt
-            if y < 20*mm:
-                c.showPage(); y = height - 20*mm
-                c.setFont("Helvetica", 10)
-            c.drawString(20*mm,y,str(r["id"]))
-            c.drawString(35*mm,y,r["type"])
-            c.drawRightString(72*mm,y,f"{amt:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-            c.drawString(75*mm,y,r["currency"])
-            c.drawString(90*mm,y,(r["category"] or "")[:24])
-            c.drawString(140*mm,y,(r["note"] or "")[:38])
-            y -= 5.5*mm
-
-        y -= 6*mm; c.setFont("Helvetica-Bold",11)
-        net = s_in - s_out
-        c.drawString(20*mm,y,f"Entrate: {s_in:.2f}  •  Uscite: {s_out:.2f}  •  Netto: {net:.2f}")
-        c.save()
-
-        buf.seek(0)
-        pdf_bytes = buf.read()
-        fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
-        return Response(content=pdf_bytes, media_type="application/pdf",
-                        headers={"Content-Disposition": f'attachment; filename=\"{fname}\""})
-    except Exception:
-        txt = "\n".join([f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}" for r in rows])
-        fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
-        return Response(content=txt.encode("utf-8"), media_type="text/plain",
-                        headers={"Content-Disposition": f'attachment; filename=\"{fname}\""})
-# === FINE DASHBOARD ============================================================
+# === FINE DASHBOARD ==========================================================
 
 
 from typing import Optional, Literal
