@@ -910,9 +910,13 @@ BRAND_BLUE = os.getenv("BRAND_BLUE", "#000A22")
 ACCENT_GOLD = os.getenv("ACCENT_GOLD", "#AA8F15")
 LOGO_URL    = os.getenv("LOGO_URL", "").strip()
 GITHUB_REPO = (os.getenv("GITHUB_REPO", "FLAI-APP/flai-app") or "").strip("/")
-# Se LOGO_URL è relativo (refs/heads/...), trasformalo in raw GitHub
+
+# Se LOGO_URL è relativo (refs/heads/... o path nel repo), trasformalo in raw GitHub
 if LOGO_URL and not LOGO_URL.startswith(("http://","https://")):
     LOGO_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{LOGO_URL.lstrip('/')}"
+
+# >>> FIX LOGO: prepara il tag già interpolato (non stringa letterale con {LOGO_URL})
+LOGO_TAG = f'<img src="{LOGO_URL}" alt="logo"/>' if LOGO_URL else ''
 
 def _iso_or_none(s: str | None) -> dt.date | None:
     if not s: return None
@@ -966,7 +970,7 @@ async def dashboard(request: Request) -> HTMLResponse:
 *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);
 font:15px/1.35 -apple-system,Segoe UI,Roboto,system-ui,sans-serif}}
 .header{{background:var(--brand);padding:10px 16px;display:flex;align-items:center;gap:12px}}
-.logo{{width:28px;height:28px;border-radius:6px;overflow:hidden;filter:brightness(0.72)}}
+.logo{{width:30px;height:30px;border-radius:6px;overflow:hidden;filter:brightness(0.72)}}
 .logo img{{width:100%;height:100%;object-fit:cover}}
 .title{{font-weight:700;letter-spacing:.3px}}
 .wrap{{max-width:1280px;margin:18px auto;padding:0 16px}}
@@ -1002,7 +1006,7 @@ th.col-date,td.col-date{{width:160px}}
 </style></head>
 <body>
   <div class="header">
-    <div class="logo">{('<img src="{LOGO_URL}" alt="logo"/>') if LOGO_URL else ''}</div>
+    <div class="logo">{LOGO_TAG}</div>  <!-- <<< QUI il logo è interpolato correttamente -->
     <div class="title">FLAI Dashboard</div>
   </div>
 
@@ -1195,13 +1199,14 @@ async def dashboard_pdf(
         pdf_bytes = buf.read()
         fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
         return Response(content=pdf_bytes, media_type="application/pdf",
-                        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+                        headers={{"Content-Disposition": f'attachment; filename="{fname}"'}})
     except Exception:
         txt = "\n".join([f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}" for r in rows])
         fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
         return Response(content=txt.encode("utf-8"), media_type="text/plain",
-                        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+                        headers={{"Content-Disposition": f'attachment; filename="{fname}"'}})
 # === FINE DASHBOARD ============================================================
+
 
 from typing import Optional, Literal
 from decimal import Decimal
