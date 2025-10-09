@@ -58,18 +58,30 @@ APP.add_middleware(
 
 # -----------------------------------------------------------------------------
 
+# --- Sicurezza: API key solo per le vere API, NON per la dashboard ---
+API_KEY_APP = os.getenv("API_KEY_APP", "")
+
+# Rotte che restano protette (webhook, API vere ecc.)
+_PROTECTED_PREFIXES = ("/api/", "/webhook", "/whatsapp", "/email", "/reports")
+
+def _is_protected(path: str) -> bool:
+    # Tutto ciò che è dashboard resta aperto
+    if path.startswith("/dashboard"):  # /dashboard, /dashboard/data, /dashboard/pdf
+        return False
+    # eventualmente lascia aperte anche healthz e logo
+    if path in ("/", "/healthz", "/favicon.ico"):
+        return False
+    return any(path.startswith(p) for p in _PROTECTED_PREFIXES)
+
 @APP.middleware("http")
 async def security_and_rate_limit(request: Request, call_next):
-# Whitelist: niente API key su queste rotte usate dal browser
     path = request.url.path
-    WHITELIST = ("/healthz", "/dashboard", "/dashboard/data", "/reports/pdf")
-    if path.startswith(WHITELIST):
-      return await call_next(request)
-
-    x_api_key = request.headers.get("X-API-Key")
-    if x_api_key != os.getenv("API_KEY_APP"):
-        raise HTTPException(status_code=401, detail="invalid api key")
-
+    # Se la rotta è protetta, serve API key
+    if _is_protected(path):
+        api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+        if not api_key or api_key != API_KEY_APP:
+            raise HTTPException(status_code=401, detail="invalid api key")
+    # continua normale
     return await call_next(request)
 
 # -----------------------------------------------------------------------------
@@ -1104,7 +1116,7 @@ async def dashboard(request: Request) -> HTMLResponse:
 *{{box-sizing:border-box}}
 body{{margin:0;background:var(--bg);color:var(--text);font:15px/1.35 -apple-system,Segoe UI,Roboto,system-ui,sans-serif}}
 .header{{background:var(--brand);padding:10px 16px;display:flex;align-items:center;gap:12px}}
-.logo{{width:30px;height:30px;border-radius:6px;overflow:hidden;filter:brightness(0.75)}} /* un pelo più chiaro del 0.70 */
+.logo{{width:30px;height:30px;border-radius:6px;overflow:hidden;filter:brightness(0.60)}} /* un pelo più chiaro del 0.70 */
 .title{{font-weight:700;letter-spacing:.3px}}
 .wrap{{max-width:1280px;margin:18px auto;padding:0 16px}}
 
