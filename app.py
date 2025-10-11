@@ -1354,7 +1354,7 @@ async def dashboard_pdf(
         pdf_bytes = buf.read()
         fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
         return Response(content=pdf_bytes, media_type="application/pdf",
-                        headers={{"Content-Disposition": f"attachment; filename=\\"{fname}\\"" }})
+                        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
     except Exception:
         # Fallback .txt
         txt = "\\n".join([f"{r['id']}\\t{r['type']}\\t{r['amount']}\\t{r['currency']}\\t{r['category']}\\t{r['note']}" for r in rows])
