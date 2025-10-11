@@ -1284,6 +1284,7 @@ async def dashboard_data(
         })
     return JSONResponse({"rows": out_rows, "sum_in": str(s_in), "sum_out": str(s_out), "sum_net": str(s_in - s_out)})
 
+
 @APP.get("/dashboard/pdf")  # type: ignore
 async def dashboard_pdf(
     request: Request,
