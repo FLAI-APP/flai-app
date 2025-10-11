@@ -461,11 +461,11 @@ async def export_movements_csv(
                 (r["note"] or "").replace("\n", " ").strip(),
                 r["created_at"].isoformat(sep=" ", timespec="seconds") if r.get("created_at") else "",
             ])
-        buf.seek(0)
+       		 buf.seek(0)
 
-        filename = "movements_export.csv"
-        headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"'
+        	filename = "movements_export.csv"
+        	headers = {
+            	"Content-Disposition": f'attachment; filename="{filename}"'
         }
         return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers=headers)
 
@@ -490,7 +490,7 @@ async def report_yearly(
     Serie annuale (ultimi 'years' anni fino all'anno corrente).
     Output: [{year, in, out, net}, ...]
     """
-    try:
+        from reportlab.lib.pagesizes import A4try:
         years = _clamp(years, 1, 50)
         with get_conn() as conn, conn.cursor() as c:
             # Serie di anni (date al 1° gennaio) e aggregati per anno
@@ -1300,77 +1300,107 @@ async def dashboard_pdf(
     with get_conn() as conn:
         rows = _fetch_dashboard_rows(conn, d_from, d_to, type, q)
 
-    # PDF semplice ma pulito (griglia base). Migliorie estetiche possiamo farle dopo.
+    # PDF pulito con intestazione e colonne allineate, NIENTE errori di quoting
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.pdfgen import canvas
         from reportlab.lib.units import mm
+        from reportlab.lib.colors import black, HexColor
 
         buf = io.BytesIO()
         c = canvas.Canvas(buf, pagesize=A4)
         width, height = A4
-        y = height - 20*mm
 
-        # Titolo+filtro
-        title = "FLAI – Report"
-        if d_from or d_to: title += f" ({d_from or ''} → {d_to or ''})"
-        if type: title += f" · {type}"
-        if q:    title += f" · filtro: {q}"
-        c.setFont("Helvetica-Bold", 14); c.drawString(20*mm, y, title); y -= 10*mm
+        # barra in alto con brand
+        c.setFillColor(HexColor(BRAND_BLUE))
+        c.rect(0, height - 14*mm, width, 14*mm, fill=1, stroke=0)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(18*mm, height - 10*mm, "FLAI – Report")
 
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(20*mm,y,"ID"); c.drawString(35*mm,y,"TP")
-        c.drawString(45*mm,y,"AMOUNT"); c.drawString(75*mm,y,"CUR")
-        c.drawString(90*mm,y,"CATEGORY"); c.drawString(140*mm,y,"NOTE"); c.drawString(170*mm,y,"CREATED AT"); y -= 6*mm
-
+        # riga filtri
+        y = height - 22*mm
+        pieces = []
+        if d_from or d_to:
+            pieces.append(f"{d_from or '…'} → {d_to or '…'}")
+        if type:
+            pieces.append(type)
+        if q:
+            pieces.append(f"filtro: {q}")
         c.setFont("Helvetica", 10)
+        c.setFillColor(black)
+        if pieces:
+            c.drawString(18*mm, y, " · ".join(pieces))
+            y -= 6*mm
+
+        # intestazione tabella
+        c.setFont("Helvetica-Bold", 10)
+        x_id=18*mm; x_tp=30*mm; x_amt=42*mm; x_cur=66*mm; x_cat=82*mm; x_note=122*mm; x_dt=176*mm
+        c.drawString(x_id,y,"ID")
+        c.drawString(x_tp,y,"TP")
+        c.drawString(x_amt,y,"AMOUNT")
+        c.drawString(x_cur,y,"CUR")
+        c.drawString(x_cat,y,"CATEGORY")
+        c.drawString(x_note,y,"NOTE")
+        c.drawString(x_dt,y,"CREATED AT")
+        y -= 5.5*mm
+        c.setFont("Helvetica", 10)
+
         s_in = Decimal("0"); s_out = Decimal("0")
         for r in rows:
             amt = Decimal(str(r["amount"]))
             if r["type"] == "in": s_in += amt
             else: s_out += amt
-            if y < 20*mm:
-                c.showPage(); y = height - 20*mm
-                c.setFont("Helvetica", 10)
-            c.drawString(20*mm,y,str(r["id"]))
-            c.drawString(35*mm,y,r["type"])
-            c.drawRightString(72*mm,y,f"{amt:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
-            c.drawString(75*mm,y,r["currency"])
-            c.drawString(90*mm,y,(r["category"] or "")[:24])
-            c.drawString(140*mm,y,(r["note"] or "")[:38])
-            # più spazio a destra per timestamp leggibile
-            created = r["created_at"]
-            if hasattr(created,"strftime"):
-                created = created.strftime("%Y-%m-%d %H:%M")
-            c.drawString(170*mm,y,str(created))
-            y -= 5.5*mm
 
-        y -= 6*mm; c.setFont("Helvetica-Bold",11)
+            if y < 20*mm:
+                c.showPage()
+                c.setFont("Helvetica", 10)
+                y = height - 20*mm
+
+            c.drawString(x_id, y, str(r["id"]))
+            c.drawString(x_tp, y, r["type"])
+            # importo allineato a destra
+            c.drawRightString(x_amt + 20*mm, y, f"{amt:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            c.drawString(x_cur, y, r["currency"])
+            c.drawString(x_cat, y, (r["category"] or "")[:30])
+            c.drawString(x_note, y, (r["note"] or "")[:50])
+
+            created = r["created_at"]
+            if hasattr(created, "strftime"):
+                created = created.strftime("%Y-%m-%d %H:%M")
+            # data allineata a destra: niente tagli
+            c.drawRightString(x_dt + 22*mm, y, str(created))
+
+            y -= 5.0*mm
+
+        # totali
+        y -= 6*mm
         net = s_in - s_out
-        c.drawString(20*mm,y,f"Entrate: {s_in:.2f}  •  Uscite: {s_out:.2f}  •  Netto: {net:.2f}")
+        cur = rows[0]["currency"] if rows else "CHF"
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(18*mm, y, f"Entrate: {s_in:.2f} {cur}  •  Uscite: {s_out:.2f} {cur}  •  Netto: {net:.2f} {cur}")
         c.save()
 
-    buf.seek(0)
-    pdf_bytes = buf.read()
-    fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
-    )
+        buf.seek(0)
+        fname = f"flai-report_{(d_from or '...')}_{(d_to or '...')}.pdf"
+        return Response(
+            content=buf.read(),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+        )
 
-except Exception as e:
-    # Fallback: genera un .txt se il PDF fallisce
-    rows_text = "\n".join(
-        f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}"
-        for r in rows
-    )
-    fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
-    return Response(
-        content=rows_text,
-        media_type="text/plain",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
-    )
+    except Exception:
+        # fallback .txt se la reportlab fallisse
+        txt = "\n".join([
+            f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}"
+            for r in rows
+        ])
+        fname = f"flai-report_{(d_from or '...')}_{(d_to or '...')}.txt"
+        return Response(
+            content=txt.encode("utf-8"),
+            media_type="text/plain",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+        )
 
 # === FINE DASHBOARD ==========================================================
 
