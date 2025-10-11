@@ -1350,22 +1350,28 @@ async def dashboard_pdf(
         c.drawString(20*mm,y,f"Entrate: {s_in:.2f}  •  Uscite: {s_out:.2f}  •  Netto: {net:.2f}")
         c.save()
 
-        buf.seek(0)
-        pdf_bytes = buf.read()
-        fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
-        return Response(content=pdf_bytes, media_type="application/pdf",
-                        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
-    except Exception:
-        # Fallback .txt
-        txt = "\\n".join([f"{r['id']}\\t{r['type']}\\t{r['amount']}\\t{r['currency']}\\t{r['category']}\\t{r['note']}" for r in rows])
-        fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
-        return Response(
-          content=pdf_bytes,
-          media_type="application/pdf",
-          headers={
-            "Content-Disposition": f'attachment; filename="{fname}"'
-    },
-)
+    buf.seek(0)
+    pdf_bytes = buf.read()
+    fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+    )
+
+except Exception as e:
+    # Fallback: genera un .txt se il PDF fallisce
+    rows_text = "\n".join(
+        f"{r['id']}\t{r['type']}\t{r['amount']}\t{r['currency']}\t{r['category']}\t{r['note']}"
+        for r in rows
+    )
+    fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
+    return Response(
+        content=rows_text,
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+    )
+
 # === FINE DASHBOARD ==========================================================
 
 
