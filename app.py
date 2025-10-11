@@ -1140,88 +1140,89 @@ th.col-date,td.col-date{{width:170px}}
   </div>
 
 <script>
-function money(v){{
-  try{{return new Intl.NumberFormat('it-CH',{{style:'decimal',minimumFractionDigits:2,maximumFractionDigits:2}}).format(Number(v))}}
-  catch{{return v}}
+function money(v) {{
+  try {{
+    return new Intl.NumberFormat('it-CH', {{ style: 'decimal', minimumFractionDigits: 2, maximumFractionDigits: 2 }}).format(Number(v));
+  }} catch {{ return v; }}
 }}
-function fmtDate(iso){{
-  if(!iso) return '';
-  const d=new Date(iso); if(Number.isNaN(d.getTime())) return iso;
-  const pad=n=>String(n).padStart(2,'0');
-  return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes())
+function fmtDate(iso) {{
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + "-" + pad(d.getMonth()+1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
 }}
-function currentQuery(){{
-  const f=document.getElementById('from').value;
-  const t=document.getElementById('to').value;
-  const typ=document.getElementById('type').value;
-  const q=document.getElementById('q').value.trim();
-  const u=new URL(window.location.origin + '/dashboard/data');
-  if(f) u.searchParams.set('from',f);
-  if(t) u.searchParams.set('to',t);
-  if(typ) u.searchParams.set('type',typ);
-  if(q) u.searchParams.set('q',q);
+function currentQuery() {{
+  const f = document.getElementById('from').value;
+  const t = document.getElementById('to').value;
+  const typ = document.getElementById('type').value;
+  const q = document.getElementById('q').value.trim();
+  const u = new URL(window.location.origin + '/dashboard/data');
+  if (f) u.searchParams.set('from', f);
+  if (t) u.searchParams.set('to', t);
+  if (typ) u.searchParams.set('type', typ);
+  if (q) u.searchParams.set('q', q);
   return u;
 }}
 
-let showAll=false; const SHOW_LIMIT=20;
-document.getElementById('toggleRows').addEventListener('click',()=>{{
-  showAll=!showAll;
+let showAll = false; const SHOW_LIMIT = 20;
+document.getElementById('toggleRows').addEventListener('click', () => {{
+  showAll = !showAll;
   document.getElementById('toggleRows').textContent = showAll ? 'Mostra 20' : 'Vedi tutto';
   loadData();
 }});
 document.getElementById('apply').addEventListener('click', loadData);
-document.getElementById('pdf').addEventListener('click',()=>{
-  const u=currentQuery(); u.pathname='/dashboard/pdf';
-  const a=document.createElement('a'); a.href=u.toString(); a.download='flai-report.pdf';
+document.getElementById('pdf').addEventListener('click', () => {{
+  const u = currentQuery(); u.pathname = '/dashboard/pdf';
+  const a = document.createElement('a'); a.href = u.toString(); a.download = 'flai-report.pdf';
   document.body.appendChild(a); a.click(); a.remove();
-});
+}});
 
 let lineChart, pieChart;
-function renderCharts(allRows){{
-  // aggrega per giorno
-  const byDay={{}}; let sumIn=0, sumOut=0;
-  for(const r of allRows){{
-    const day=(r.created_at||'').slice(0,10); // YYYY-MM-DD
-    const amt=Number(r.amount||0); const isIn=(r.type==='in');
-    if(!byDay[day]) byDay[day]={{in:0,out:0}};
-    if(isIn){{ byDay[day].in+=amt; sumIn+=amt; }} else {{ byDay[day].out+=amt; sumOut+=amt; }}
+function renderCharts(allRows) {{
+  const byDay = {{}}; let sumIn = 0, sumOut = 0;
+  for (const r of allRows) {{
+    const day = (r.created_at || '').slice(0,10);
+    const amt = Number(r.amount || 0);
+    const isIn = (r.type === 'in');
+    if (!byDay[day]) byDay[day] = {{ in: 0, out: 0 }};
+    if (isIn) {{ byDay[day].in += amt; sumIn += amt; }} else {{ byDay[day].out += amt; sumOut += amt; }}
   }}
-  const days=Object.keys(byDay).sort();
-  const inSerie=days.map(d=>byDay[d].in);
-  const outSerie=days.map(d=>byDay[d].out);
+  const days = Object.keys(byDay).sort();
+  const inSerie = days.map(d => byDay[d].in);
+  const outSerie = days.map(d => byDay[d].out);
 
-  // linea
   const lc = document.getElementById('lineChart').getContext('2d');
-  if(lineChart) lineChart.destroy();
+  if (lineChart) lineChart.destroy();
   lineChart = new Chart(lc, {{
-    type:'line',
-    data:{{ labels:days, datasets:[
-      {{ label:'Entrate', data:inSerie, tension:.35 }},
-      {{ label:'Uscite', data:outSerie, tension:.35 }}
-    ]}},
-    options:{{ responsive:true, maintainAspectRatio:false,
-      plugins:{{ legend:{{labels:{{color:'#cbd3df'}}}} }},
-      scales:{{ x:{{ ticks:{{color:'#cbd3df'}} }}, y:{{ ticks:{{color:'#cbd3df'}} }} }}
+    type: 'line',
+    data: {{ labels: days, datasets: [
+      {{ label: 'Entrate', data: inSerie, tension: .35 }},
+      {{ label: 'Uscite',  data: outSerie, tension: .35 }}
+    ] }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      plugins: {{ legend: {{ labels: {{ color: '#cbd3df' }} }} }},
+      scales:  {{ x: {{ ticks: {{ color: '#cbd3df' }} }}, y: {{ ticks: {{ color: '#cbd3df' }} }} }}
     }}
   }});
 
-  // torta
   const pc = document.getElementById('pieChart').getContext('2d');
-  if(pieChart) pieChart.destroy();
+  if (pieChart) pieChart.destroy();
   pieChart = new Chart(pc, {{
-    type:'pie',
-    data:{{ labels:['Entrate','Uscite'], datasets:[{{ data:[sumIn,sumOut] }}] }},
-    options:{{ responsive:true, maintainAspectRatio:false,
-      plugins:{{ legend:{{labels:{{color:'#cbd3df'}}}} }}
+    type: 'pie',
+    data: {{ labels: ['Entrate','Uscite'], datasets: [ {{ data: [sumIn, sumOut] }} ] }},
+    options: {{ responsive: true, maintainAspectRatio: false,
+      plugins: {{ legend: {{ labels: {{ color: '#cbd3df' }} }} }}
     }}
   }});
 }}
 
-async function loadData(){{
-  const url=currentQuery();
-  const res=await fetch(url);
-  if(!res.ok){{ alert('Errore nel caricamento dati ('+res.status+')'); return; }}
-  const js=await res.json();
+async function loadData() {{
+  const url = currentQuery();
+  const res = await fetch(url);
+  if (!res.ok) {{ alert('Errore nel caricamento dati (' + res.status + ')'); return; }}
+  const js = await res.json();
 
   document.getElementById('sum_in').textContent  = money(js.sum_in)  + " CHF";
   document.getElementById('sum_out').textContent = money(js.sum_out) + " CHF";
@@ -1230,9 +1231,9 @@ async function loadData(){{
   const all = js.rows || [];
   const rows = showAll ? all : all.slice(0, SHOW_LIMIT);
 
-  const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
-  for(const r of rows){{
-    const tr=document.createElement('tr');
+  const tb = document.querySelector('#tbl tbody'); tb.innerHTML = '';
+  for (const r of rows) {{
+    const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="col-id">${{r.id}}</td>
       <td class="col-type">${{r.type}}</td>
@@ -1249,6 +1250,7 @@ async function loadData(){{
 
 loadData();
 </script>
+
 </body></html>"""
     return HTMLResponse(html)
 
