@@ -461,11 +461,11 @@ async def export_movements_csv(
                 (r["note"] or "").replace("\n", " ").strip(),
                 r["created_at"].isoformat(sep=" ", timespec="seconds") if r.get("created_at") else "",
             ])
-       		 buf.seek(0)
+             buf.seek(0)
 
-        	filename = "movements_export.csv"
-        	headers = {
-            	"Content-Disposition": f'attachment; filename="{filename}"'
+            filename = "movements_export.csv"
+            headers = {
+                "Content-Disposition": f'attachment; filename="{filename}"'
         }
         return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers=headers)
 
@@ -718,7 +718,7 @@ async def report_pdf(
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
-	    headers={"Content-Disposition": 'attachment; filename="{}"'.format(fname)}
+        headers={"Content-Disposition": 'attachment; filename="{}"'.format(fname)}
         )
     except Exception as e:
         return {"error": "pdf_failed", "detail": str(e)}
