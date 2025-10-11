@@ -1245,7 +1245,10 @@ async function loadData() {{
     tb.appendChild(tr);
   }}
 
-  renderCharts(all);
+}}
+
+loadData();
+</script>  renderCharts(all);
 }}
 
 loadData();
@@ -1356,9 +1359,13 @@ async def dashboard_pdf(
         # Fallback .txt
         txt = "\\n".join([f"{r['id']}\\t{r['type']}\\t{r['amount']}\\t{r['currency']}\\t{r['category']}\\t{r['note']}" for r in rows])
         fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.txt"
-        return Response(content=txt.encode("utf-8"), media_type="text/plain",
-                        headers={{"Content-Disposition": f"attachment; filename=\\"{fname}\\"" }})
-
+        return Response(
+          content=pdf_bytes,
+          media_type="application/pdf",
+          headers={
+            "Content-Disposition": f'attachment; filename="{fname}"'
+    },
+)
 # === FINE DASHBOARD ==========================================================
 
 
