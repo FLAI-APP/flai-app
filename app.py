@@ -137,7 +137,11 @@ async def healthz():
             row = cur.fetchone()
         return {"ok": True, "db": row["ok"] == 1}
     except Exception as e:
-        return JSONResponse({"error": "db_bootstrap_failed", "detail": str(e)}, status_code=500)
+        return JSONResponse(
+            {"error": "db_bootstrap_failed", "detail": str(e)},
+            status_code=500
+        )
+
 
 # -----------------------------------------------------------------------------
 # Chat demo (POST /messages) — echo + salva su DB
@@ -149,7 +153,11 @@ async def create_message(payload: dict = Body(...)):
         raise HTTPException(422, detail="message required")
 
     reply = f"Hai scritto: {text}"
-    try:
+          with get_conn() as conn, conn.cursor() as c:
+            q = """
+                SELECT id, type, amount, currency, category, note, created_at
+                FROM movements
+                WHERE 1=1  try:
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO messages(content, reply) VALUES (%s, %s) RETURNING id",
@@ -177,7 +185,15 @@ async def create_movement(item: dict = Body(...)):
     cat = item.get("category")
     note = item.get("note")
 
-    try:
+        with get_conn() as conn, conn.cursor() as c:
+            q = """
+                SELECT id, type, amount, currency, category, note, created_at
+                FROM movements
+                WHERE 1=1
+            """
+            params: list = []
+            if d_from:
+                q += " AND created_at::date >= %s"    try:
         with get_conn() as conn, conn.cursor() as c:
             c.execute(
                 """
@@ -413,18 +429,18 @@ async def reports_monthly(
         return {"error": "db_failed_report_monthly", "detail": str(e)}
 
 
-@APP.get("/export/movements.csv")
+from io import StringIO
+import csv
+
+@APP.get("/export/movements/csv")
 async def export_movements_csv(
-    _from: str | None = Query(None, alias="from"),
+    request: Request,
+    from_: str | None = Query(None, alias="from"),
     to: str | None = None,
     category: str | None = None,
 ):
-    """
-    Esporta i movimenti in CSV (scaricabile).
-    Filtri: from (YYYY-MM-DD), to (YYYY-MM-DD), category.
-    """
-    d_from = _parse_iso_date(_from)
-    d_to = _parse_iso_date(to)
+    d_from = _iso_or_none(from_)
+    d_to   = _iso_or_none(to)
 
     try:
         with get_conn() as conn, conn.cursor() as c:
@@ -443,33 +459,44 @@ async def export_movements_csv(
             if category:
                 q += " AND category = %s"
                 params.append(category)
-            q += " ORDER BY created_at DESC"
+
+            q += " ORDER BY created_at DESC, id DESC"
             c.execute(q, params)
             rows = c.fetchall()
 
-            # Genera CSV in memoria
-            buf = StringIO()
-            writer = csv.writer(buf)
-            writer.writerow(["id", "type", "amount", "currency", "category", "note", "created_at"])  # header
-            for r in rows:
-                writer.writerow([
-                    r["id"],
-                    r["type"],
-                    r["amount"],
-                    r["currency"],
-                    r["category"] or "",
-                    r["note"] or "",
-                    r["created_at"].isoformat(sep=" ", timespec="seconds") if r.get("created_at") else "",
-                ])
-
-            buf.seek(0)
-            pdf_bytes = buf.read()
-            fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
-            return Response(
-                content=pdf_bytes,
-                media_type="application/pdf",
-                headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+        # CSV in memoria
+        buf = StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["id", "type", "amount", "currency", "category", "note", "created_at"])  # header
+        for r in rows:
+            created = (
+                r["created_at"].isoformat(sep=" ", timespec="seconds")
+                if r.get("created_at") else ""
             )
+            writer.writerow([
+                r["id"],
+                r["type"],
+                str(r["amount"]),
+                r["currency"],
+                r.get("category") or "",
+                (r.get("note") or "").replace("\n", " ").strip(),
+                created,
+            ])
+
+        csv_bytes = buf.getvalue().encode("utf-8")
+        fname = f'flai-report_{(d_from or "")}_{(d_to or "")}.csv'
+        return Response(
+            content=csv_bytes,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            {"error": "db_failed_export", "detail": str(e)},
+            status_code=500
+        )
+
 
 # ================================
 # REPORT: YEARLY & CUSTOM
