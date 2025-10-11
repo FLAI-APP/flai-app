@@ -447,28 +447,30 @@ async def export_movements_csv(
             c.execute(q, params)
             rows = c.fetchall()
 
-        # Genera CSV in memoria
-        buf = StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(["id", "type", "amount", "currency", "category", "note", "created_at"])  # header
-        for r in rows:
-            writer.writerow([
-                r["id"],
-                r["type"],
-                r["amount"],
-                r["currency"],
-                r["category"] or "",
-                (r["note"] or "").replace("\n", " ").strip(),
-                r["created_at"].isoformat(sep=" ", timespec="seconds") if r.get("created_at") else "",
-            ])
-     buf.seek(0)
-     pdf_bytes = buf.read()
-     fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
-     return Response(
-         content=pdf_bytes,
-         media_type="application/pdf",
-         headers={"Content-Disposition": f'attachment; filename="{fname}"'}
-     )
+            # Genera CSV in memoria
+            buf = StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(["id", "type", "amount", "currency", "category", "note", "created_at"])  # header
+            for r in rows:
+                writer.writerow([
+                    r["id"],
+                    r["type"],
+                    r["amount"],
+                    r["currency"],
+                    r["category"] or "",
+                    r["note"] or "",
+                    r["created_at"].isoformat(sep=" ", timespec="seconds") if r.get("created_at") else "",
+                ])
+
+            buf.seek(0)
+            pdf_bytes = buf.read()
+            fname = f"flai-report_{(d_from or '')}_{(d_to or '')}.pdf"
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+            )
+
 # ================================
 # REPORT: YEARLY & CUSTOM
 # ================================
